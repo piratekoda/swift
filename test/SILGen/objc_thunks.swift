@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -Xllvm -sil-full-demangle -sdk %S/Inputs -I %S/Inputs -enable-source-import %s -emit-silgen -emit-verbose-sil | %FileCheck %s
+// RUN: %target-swift-frontend -Xllvm -sil-full-demangle -Xllvm -sil-print-debuginfo -sdk %S/Inputs -I %S/Inputs -enable-source-import %s -emit-silgen -emit-verbose-sil | %FileCheck %s
 
 // REQUIRES: objc_interop
 
@@ -90,7 +90,9 @@ class Hoozit : Gizmo {
   // CHECK: bb0(%0 : $Hoozit):
   // CHECK-NEXT:   debug_value %0
   // CHECK-NEXT:   [[ADDR:%.*]] = ref_element_addr %0 : {{.*}}, #Hoozit.typicalProperty
-  // CHECK-NEXT:   [[RES:%.*]] = load [copy] [[ADDR]] {{.*}}
+  // CHECK-NEXT:   [[READ:%.*]] = begin_access [read] [dynamic] [[ADDR]] : $*Gizmo
+  // CHECK-NEXT:   [[RES:%.*]] = load [copy] [[READ]] {{.*}}
+  // CHECK-NEXT:   end_access [[READ]] : $*Gizmo
   // CHECK-NEXT:   return [[RES]]
 
   // -- setter
@@ -104,7 +106,7 @@ class Hoozit : Gizmo {
   // CHECK:   [[RES:%.*]] = apply [[FR]]([[VALUE_COPY]], [[BORROWED_THIS_COPY]])
   // CHECK:   end_borrow [[BORROWED_THIS_COPY]] from [[THIS_COPY]]
   // CHECK:   destroy_value [[THIS_COPY]]
-  // CHECK:   return [[RES]] : $(), scope {{.*}} // id: {{.*}} line:[[@LINE-32]]:13:auto_gen
+  // CHECK:   return [[RES]] : $(), scope {{.*}} // id: {{.*}} line:[[@LINE-34]]:13:auto_gen
   // CHECK: } // end sil function '_T011objc_thunks6HoozitC15typicalPropertySo5GizmoCfsTo'
 
   // CHECK-LABEL: sil hidden @_T011objc_thunks6HoozitC15typicalPropertySo5GizmoCfs
@@ -112,7 +114,9 @@ class Hoozit : Gizmo {
   // CHECK:   [[BORROWED_ARG0:%.*]] = begin_borrow [[ARG0]]
   // CHECK:   [[ARG0_COPY:%.*]] = copy_value [[BORROWED_ARG0]]
   // CHECK:   [[ADDR:%.*]] = ref_element_addr [[ARG1]] : {{.*}}, #Hoozit.typicalProperty
-  // CHECK:   assign [[ARG0_COPY]] to [[ADDR]] : $*Gizmo
+  // CHECK:   [[WRITE:%.*]] = begin_access [modify] [dynamic] [[ADDR]] : $*Gizmo
+  // CHECK:   assign [[ARG0_COPY]] to [[WRITE]] : $*Gizmo
+  // CHECK:   end_access [[WRITE]] : $*Gizmo
   // CHECK:   end_borrow [[BORROWED_ARG0]] from [[ARG0]]
   // CHECK:   destroy_value [[ARG0]]
   // CHECK: } // end sil function '_T011objc_thunks6HoozitC15typicalPropertySo5GizmoCfs'
@@ -135,7 +139,9 @@ class Hoozit : Gizmo {
   // CHECK-LABEL: sil hidden @_T011objc_thunks6HoozitC12copyPropertySo5GizmoCfg
   // CHECK: bb0(%0 : $Hoozit):
   // CHECK:        [[ADDR:%.*]] = ref_element_addr %0 : {{.*}}, #Hoozit.copyProperty
-  // CHECK-NEXT:   [[RES:%.*]] = load [copy] [[ADDR]]
+  // CHECK-NEXT:   [[READ:%.*]] = begin_access [read] [dynamic] [[ADDR]] : $*Gizmo
+  // CHECK-NEXT:   [[RES:%.*]] = load [copy] [[READ]]
+  // CHECK-NEXT:   end_access [[READ]] : $*Gizmo
   // CHECK-NEXT:   return [[RES]]
 
   // -- setter is normal
@@ -156,7 +162,9 @@ class Hoozit : Gizmo {
   // CHECK:   [[BORROWED_ARG1:%.*]] = begin_borrow [[ARG1]]
   // CHECK:   [[ARG1_COPY:%.*]] = copy_value [[BORROWED_ARG1]]
   // CHECK:   [[ADDR:%.*]] = ref_element_addr [[SELF]] : {{.*}}, #Hoozit.copyProperty
-  // CHECK:   assign [[ARG1_COPY]] to [[ADDR]]
+  // CHECK:   [[WRITE:%.*]] = begin_access [modify] [dynamic] [[ADDR]] : $*Gizmo
+  // CHECK:   assign [[ARG1_COPY]] to [[WRITE]]
+  // CHECK:   end_access [[WRITE]] : $*Gizmo
   // CHECK:   end_borrow [[BORROWED_ARG1]] from [[ARG1]]
   // CHECK:   destroy_value [[ARG1]]
   // CHECK: } // end sil function '_T011objc_thunks6HoozitC12copyPropertySo5GizmoCfs'
@@ -445,9 +453,9 @@ extension Hoozit {
 // Calling objc methods of subclass should go through native entry points
 func useHoozit(_ h: Hoozit) {
 // sil @_T011objc_thunks9useHoozityAA0D0C1h_tF
-  // In the class decl, gets dynamically dispatched
+  // In the class decl, overrides importd method, 'dynamic' was inferred
   h.fork()
-  // CHECK: class_method {{%.*}} : {{.*}}, #Hoozit.fork!1 :
+  // CHECK: class_method [volatile] {{%.*}} : {{.*}}, #Hoozit.fork!1.foreign
 
   // In an extension, 'dynamic' was inferred.
   h.foof()

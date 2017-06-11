@@ -794,6 +794,8 @@ Globals
 
   global ::= type 'Wy' // Outlined Copy Function Type
   global ::= type 'We' // Outlined Consume Function Type
+  global ::= type 'Wr' // Outlined Retain Function Type
+  global ::= type 'Ws' // Outlined Release Function Type
 
   DIRECTNESS ::= 'd'                         // direct
   DIRECTNESS ::= 'i'                         // indirect
@@ -824,7 +826,8 @@ types where the metadata itself has unknown layout.)
   global ::= protocol-conformance entity 'TW' // protocol witness thunk
   global ::= context identifier identifier 'TB' // property behavior initializer thunk (not used currently)
   global ::= context identifier identifier 'Tb' // property behavior setter thunk (not used currently)
-  global ::= global 'T_' specialization  // reset substitutions before demangling specialization
+  global ::= global specialization       // function specialization
+  global ::= global 'Tm'                 // merged function
   global ::= entity                      // some identifiable thing
   global ::= type type generic-signature? 'T' REABSTRACT-THUNK-TYPE   // reabstraction thunk helper function
 
@@ -874,8 +877,8 @@ Entities
   curry-thunk ::= 'Tc'
 
   // The leading type is the function type
-  entity-spec ::= type 'fC'                  // allocating constructor
-  entity-spec ::= type 'fc'                  // non-allocating constructor
+  entity-spec ::= type file-discriminator? 'fC'      // allocating constructor
+  entity-spec ::= type file-discriminator? 'fc'      // non-allocating constructor
   entity-spec ::= type 'fU' INDEX            // explicit anonymous closure expression
   entity-spec ::= type 'fu' INDEX            // implicit anonymous closure
   entity-spec ::= 'fA' INDEX                 // default argument N+1 generator
@@ -908,14 +911,16 @@ Entities
 
   decl-name ::= identifier
   decl-name ::= identifier 'L' INDEX         // locally-discriminated declaration
-  decl-name ::= identifier identifier 'LL'    // file-discriminated declaration
+  decl-name ::= identifier identifier 'LL'   // file-discriminated declaration
 
-The first identifier in a file-discriminated ``<decl-name>>`` is a string that
-represents the file the original declaration came from.
-It should be considered unique within the enclosing module.
-The second identifier is the name of the entity.
-Not all declarations marked ``private`` declarations will use this mangling;
-if the entity's context is enough to uniquely identify the entity, the simple
+  file-discriminator ::= identifier 'Ll'     // anonymous file-discriminated declaration
+
+The identifier in a ``<file-discriminator>`` and the first identifier in a
+file-discriminated ``<decl-name>`` is a string that represents the file the
+original declaration came from. It should be considered unique within the
+enclosing module. The second identifier is the name of the entity. Not all
+declarations marked ``private`` declarations will use this mangling; if the
+entity's context is enough to uniquely identify the entity, the simple
 ``identifier`` form is preferred.
 
 Declaration Contexts
@@ -1101,6 +1106,7 @@ mangled in to disambiguate.
   FUNC-REPRESENTATION ::= 'W'                // protocol witness
 
   PARAM-CONVENTION ::= 'i'                   // indirect in
+  PARAM-CONVENTION ::= 'c'                   // indirect in constant
   PARAM-CONVENTION ::= 'l'                   // indirect inout
   PARAM-CONVENTION ::= 'b'                   // indirect inout aliasable
   PARAM-CONVENTION ::= 'n'                   // indirect in guaranteed

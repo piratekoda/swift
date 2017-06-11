@@ -1,4 +1,4 @@
-//===--- MixedTypeArithmeticsDiagnostics.swift ----------------------------===//
+//===--- MixedTypeArithmeticsDiagnostics4.swift ---------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -32,4 +32,10 @@ func mixedTypeArithemtics() {
     var x = Int()
     x += (42 as Int)
   }
+}
+
+func radar31909031() {
+  let x = UInt64()
+  let y = UInt64()
+  _ = (x - y) < UInt64(42) // should not produce a mixed-type warning
 }

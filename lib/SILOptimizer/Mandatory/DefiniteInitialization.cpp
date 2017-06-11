@@ -25,6 +25,7 @@
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
 
@@ -35,11 +36,19 @@
 using namespace swift;
 using namespace ownership;
 
+llvm::cl::opt<bool> TriggerUnreachableOnFailure(
+    "sil-di-assert-on-failure", llvm::cl::init(false),
+    llvm::cl::desc("After emitting a DI error, assert instead of continuing. "
+                   "Meant for debugging ONLY!"),
+    llvm::cl::Hidden);
+
 STATISTIC(NumAssignRewritten, "Number of assigns rewritten");
 
 template<typename ...ArgTypes>
 static void diagnose(SILModule &M, SILLocation loc, ArgTypes... args) {
   M.getASTContext().Diags.diagnose(loc.getSourceLoc(), Diagnostic(args...));
+  if (TriggerUnreachableOnFailure)
+    llvm_unreachable("Triggering standard assertion failure routine");
 }
 
 enum class PartialInitializationKind {
@@ -881,10 +890,10 @@ void LifetimeChecker::handleLoadUse(unsigned UseID) {
   // If this is an OpenExistentialAddrInst in preparation for applying
   // a witness method, analyze its use to make sure, that no mutation of
   // lvalue let constants occurs.
-  auto* OEAI = dyn_cast<OpenExistentialAddrInst>(LoadInst);
+  auto *OEAI = dyn_cast<OpenExistentialAddrInst>(LoadInst);
   if (OEAI != nullptr && TheMemory.isElementLetProperty(Use.FirstElement)) {
     for (auto OEAUse : OEAI->getUses()) {
-      auto* AI = dyn_cast<ApplyInst>(OEAUse->getUser());
+      auto *AI = dyn_cast<ApplyInst>(OEAUse->getUser());
 
       if (AI == nullptr)
         // User is not an ApplyInst
@@ -1094,9 +1103,9 @@ void LifetimeChecker::handleInOutUse(const DIMemoryUse &Use) {
     // about the method.  The magic numbers used by the diagnostic are:
     // 0 -> method, 1 -> property, 2 -> subscript, 3 -> operator.
     unsigned Case = ~0;
-    Identifier MethodName;
+    DeclBaseName MethodName;
     if (FD && FD->isAccessor()) {
-      MethodName = FD->getAccessorStorageDecl()->getName();
+      MethodName = FD->getAccessorStorageDecl()->getBaseName();
       Case = isa<SubscriptDecl>(FD->getAccessorStorageDecl()) ? 2 : 1;
     } else if (FD && FD->isOperator()) {
       MethodName = FD->getName();
@@ -1374,9 +1383,9 @@ bool LifetimeChecker::diagnoseMethodCall(const DIMemoryUse &Use,
   if (Method) {
     if (!shouldEmitError(Inst)) return true;
 
-    Identifier Name;
+    DeclBaseName Name;
     if (Method->isAccessor())
-      Name = Method->getAccessorStorageDecl()->getName();
+      Name = Method->getAccessorStorageDecl()->getBaseName();
     else
       Name = Method->getName();
 
@@ -2228,8 +2237,7 @@ handleConditionalDestroys(SILValue ControlVariableAddr) {
       }
       case DIKind::Yes:
         // super.init() already called, just release the value.
-        Release->removeFromParent();
-        B.getInsertionBB()->insert(B.getInsertionPoint(), Release);
+        Release->moveBefore(&*B.getInsertionPoint());
         continue;
       }
     }
@@ -2598,11 +2606,6 @@ bool LifetimeChecker::isInitializedAtUse(const DIMemoryUse &Use,
 
   return true;
 }
-
-
-
-
-
 
 //===----------------------------------------------------------------------===//
 //                           Top Level Driver

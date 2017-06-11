@@ -781,21 +781,30 @@ void ide::collectModuleNames(StringRef SDKPath,
   }
 }
 
-DeclNameViewer::DeclNameViewer(StringRef Text) {
+DeclNameViewer::DeclNameViewer(StringRef Text): IsValid(true), HasParen(false) {
   auto ArgStart = Text.find_first_of('(');
   if (ArgStart == StringRef::npos) {
     BaseName = Text;
     return;
   }
+  HasParen = true;
   BaseName = Text.substr(0, ArgStart);
   auto ArgEnd = Text.find_last_of(')');
-  assert(ArgEnd != StringRef::npos);
+  if (ArgEnd == StringRef::npos) {
+    IsValid = false;
+    return;
+  }
   StringRef AllArgs = Text.substr(ArgStart + 1, ArgEnd - ArgStart - 1);
   AllArgs.split(Labels, ":");
   if (Labels.empty())
     return;
-  assert(Labels.back().empty());
-  Labels.pop_back();
+  if ((IsValid = Labels.back().empty())) {
+    Labels.pop_back();
+    std::transform(Labels.begin(), Labels.end(), Labels.begin(),
+        [](StringRef Label) {
+      return Label == "_" ? StringRef() : Label;
+    });
+  }
 }
 
 unsigned DeclNameViewer::commonPartsCount(DeclNameViewer &Other) const {
@@ -905,7 +914,7 @@ public:
       RewriteBuf.write(OS);
   }
 };
-}
+} // end anonymous namespace
 struct swift::ide::SourceEditOutputConsumer::Implementation {
   ClangFileRewriterHelper Rewriter;
   Implementation(SourceManager &SM, unsigned BufferId, llvm::raw_ostream &OS)

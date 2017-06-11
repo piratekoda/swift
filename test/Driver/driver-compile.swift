@@ -1,4 +1,4 @@
-// RUN: rm -rf %t && mkdir -p %t
+// RUN: %empty-directory(%t)
 
 // RUN: %swiftc_driver -driver-print-jobs -target x86_64-apple-macosx10.9 %s 2>&1 > %t.simple.txt
 // RUN: %FileCheck %s < %t.simple.txt
@@ -37,7 +37,7 @@
 
 // RUN: %swiftc_driver -driver-print-jobs -c -target x86_64-apple-macosx10.9 %s %S/../Inputs/empty.swift -module-name main -driver-use-filelists 2>&1 | %FileCheck -check-prefix=FILELIST %s
 
-// RUN: rm -rf %t && mkdir -p %t/DISTINCTIVE-PATH/usr/bin/
+// RUN: %empty-directory(%t)/DISTINCTIVE-PATH/usr/bin/
 // RUN: %hardlink-or-copy(from: %swift_driver_plain, to: %t/DISTINCTIVE-PATH/usr/bin/swiftc)
 // RUN: ln -s "swiftc" %t/DISTINCTIVE-PATH/usr/bin/swift-update
 // RUN: %t/DISTINCTIVE-PATH/usr/bin/swiftc -driver-print-jobs -c -update-code -target x86_64-apple-macosx10.9 %s 2>&1 > %t.upd.txt
@@ -111,9 +111,8 @@
 // FILELIST: -output-filelist {{[^-]}}
 
 // UPDATE-CODE: DISTINCTIVE-PATH/usr/bin/swift
-// UPDATE-CODE: -frontend
-// UPDATE-CODE: -update-code
-// UPDATE-CODE: -o {{.+}}.remap
+// UPDATE-CODE: -frontend -c
+// UPDATE-CODE: -emit-remap-file-path {{.+}}.remap
 
 // NO-REFERENCE-DEPENDENCIES: bin/swift
 // NO-REFERENCE-DEPENDENCIES-NOT: -emit-reference-dependencies

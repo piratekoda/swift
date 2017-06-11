@@ -13,9 +13,20 @@
 #include "IRGenMangler.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/Demangling/ManglingMacros.h"
+#include "swift/Demangling/Demangle.h"
+#include "swift/Runtime/Metadata.h"
 
 using namespace swift;
 using namespace irgen;
+
+const char *getManglingForWitness(swift::Demangle::ValueWitnessKind kind) {
+  switch (kind) {
+#define VALUE_WITNESS(MANGLING, NAME) \
+  case swift::Demangle::ValueWitnessKind::NAME: return #MANGLING;
+#include "swift/Demangling/ValueWitnessMangling.def"
+  }
+  llvm_unreachable("not a function witness");
+}
 
 std::string IRGenMangler::mangleValueWitness(Type type, ValueWitness witness) {
   beginMangling();
@@ -23,9 +34,25 @@ std::string IRGenMangler::mangleValueWitness(Type type, ValueWitness witness) {
 
   const char *Code = nullptr;
   switch (witness) {
-#define VALUE_WITNESS(MANGLING, NAME) \
-    case ValueWitness::NAME: Code = #MANGLING; break;
-#include "swift/Demangling/ValueWitnessMangling.def"
+#define GET_MANGLING(ID) \
+    case ValueWitness::ID: Code = getManglingForWitness(swift::Demangle::ValueWitnessKind::ID); break;
+    GET_MANGLING(InitializeBufferWithCopyOfBuffer) \
+    GET_MANGLING(Destroy) \
+    GET_MANGLING(InitializeWithCopy) \
+    GET_MANGLING(AssignWithCopy) \
+    GET_MANGLING(InitializeWithTake) \
+    GET_MANGLING(AssignWithTake) \
+    GET_MANGLING(InitializeBufferWithTakeOfBuffer) \
+    GET_MANGLING(DestroyArray) \
+    GET_MANGLING(InitializeArrayWithCopy) \
+    GET_MANGLING(InitializeArrayWithTakeFrontToBack) \
+    GET_MANGLING(InitializeArrayWithTakeBackToFront)
+    GET_MANGLING(StoreExtraInhabitant) \
+    GET_MANGLING(GetExtraInhabitantIndex) \
+    GET_MANGLING(GetEnumTag) \
+    GET_MANGLING(DestructiveProjectEnumData) \
+    GET_MANGLING(DestructiveInjectEnumTag)
+#undef GET_MANGLING
     case ValueWitness::Size:
     case ValueWitness::Flags:
     case ValueWitness::Stride:
@@ -94,7 +121,18 @@ mangleProtocolForLLVMTypeName(ProtocolCompositionType *type) {
         appendOperator("_");
     }
     if (layout.superclass) {
-      appendType(layout.superclass);
+      auto superclassTy = layout.superclass;
+
+      // We share type infos for different instantiations of a generic type
+      // when the archetypes have the same exemplars.  We cannot mangle
+      // archetypes, and the mangling does not have to be unique, so we just
+      // mangle the unbound generic form of the type.
+      if (superclassTy->hasArchetype()) {
+        superclassTy = superclassTy->getClassOrBoundGenericClass()
+          ->getDeclaredType();
+      }
+
+      appendType(CanType(superclassTy));
       appendOperator("Xc");
     } else if (layout.getLayoutConstraint()) {
       appendOperator("Xl");

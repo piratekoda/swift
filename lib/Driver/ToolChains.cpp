@@ -126,6 +126,9 @@ static void addCommonFrontendArgs(const ToolChain &TC,
   inputArgs.AddLastArg(arguments, options::OPT_autolink_force_load);
   inputArgs.AddLastArg(arguments, options::OPT_color_diagnostics);
   inputArgs.AddLastArg(arguments, options::OPT_fixit_all);
+  inputArgs.AddLastArg(arguments,
+                       options::OPT_warn_swift3_objc_inference_minimal,
+                       options::OPT_warn_swift3_objc_inference_complete);
   inputArgs.AddLastArg(arguments, options::OPT_enable_app_extension);
   inputArgs.AddLastArg(arguments, options::OPT_enable_testing);
   inputArgs.AddLastArg(arguments, options::OPT_g_Group);
@@ -249,6 +252,7 @@ ToolChain::constructInvocation(const CompileJobAction &job,
     case types::TY_ObjCHeader:
     case types::TY_Image:
     case types::TY_SwiftDeps:
+    case types::TY_ModuleTrace:
       llvm_unreachable("Output type can never be primary output.");
     case types::TY_INVALID:
       llvm_unreachable("Invalid type ID");
@@ -292,6 +296,16 @@ ToolChain::constructInvocation(const CompileJobAction &job,
           FoundPrimaryInput = true;
         }
         Arguments.push_back(inputPair.second->getValue());
+
+        // Forward migrator flags.
+        if (auto DataPath = context.Args.getLastArg(options::
+                                                    OPT_api_diff_data_file)) {
+          Arguments.push_back("-api-diff-data-file");
+          Arguments.push_back(DataPath->getValue());
+        }
+        if (context.Args.hasArg(options::OPT_dump_usr)) {
+          Arguments.push_back("-dump-usr");
+        }
       }
     }
     break;
@@ -324,16 +338,33 @@ ToolChain::constructInvocation(const CompileJobAction &job,
   // of any input PCH to the current action if one is present.
   if (context.Args.hasArgNoClaim(options::OPT_import_objc_header)) {
     bool ForwardAsIs = true;
-    for (auto *IJ : context.Inputs) {
-      if (!IJ->getOutput().getAnyOutputForType(types::TY_PCH).empty()) {
-        Arguments.push_back("-import-objc-header");
-        addInputsOfType(Arguments, context.Inputs, types::TY_PCH);
-        ForwardAsIs = false;
-        break;
+    bool bridgingPCHIsEnabled =
+        context.Args.hasFlag(options::OPT_enable_bridging_pch,
+                             options::OPT_disable_bridging_pch,
+                             true);
+    bool usePersistentPCH = bridgingPCHIsEnabled &&
+        context.Args.hasArg(options::OPT_pch_output_dir);
+    if (!usePersistentPCH) {
+      for (auto *IJ : context.Inputs) {
+        if (!IJ->getOutput().getAnyOutputForType(types::TY_PCH).empty()) {
+          Arguments.push_back("-import-objc-header");
+          addInputsOfType(Arguments, context.Inputs, types::TY_PCH);
+          ForwardAsIs = false;
+          break;
+        }
       }
     }
     if (ForwardAsIs) {
       context.Args.AddLastArg(Arguments, options::OPT_import_objc_header);
+    }
+    if (usePersistentPCH) {
+      context.Args.AddLastArg(Arguments, options::OPT_pch_output_dir);
+      if (context.OI.CompilerMode == OutputInfo::Mode::StandardCompile) {
+        // In the 'multiple invocations for each file' mode we don't need to
+        // validate the PCH every time, it has been validated with the initial
+        // -emit-pch invocation.
+        Arguments.push_back("-pch-disable-validation");
+      }
     }
   }
 
@@ -381,10 +412,21 @@ ToolChain::constructInvocation(const CompileJobAction &job,
     Arguments.push_back(ReferenceDependenciesPath.c_str());
   }
 
+  const std::string &LoadedModuleTracePath =
+      context.Output.getAdditionalOutputForType(types::TY_ModuleTrace);
+  if (!LoadedModuleTracePath.empty()) {
+    Arguments.push_back("-emit-loaded-module-trace-path");
+    Arguments.push_back(LoadedModuleTracePath.c_str());
+  }
+
+  if (context.Args.hasArg(options::OPT_migrate_keep_objc_visibility)) {
+    Arguments.push_back("-migrate-keep-objc-visibility");
+  }
+
   const std::string &FixitsPath =
     context.Output.getAdditionalOutputForType(types::TY_Remapping);
   if (!FixitsPath.empty()) {
-    Arguments.push_back("-emit-fixits-path");
+    Arguments.push_back("-emit-remap-file-path");
     Arguments.push_back(FixitsPath.c_str());
   }
 
@@ -511,6 +553,7 @@ ToolChain::constructInvocation(const BackendJobAction &job,
     case types::TY_Image:
     case types::TY_SwiftDeps:
     case types::TY_Remapping:
+    case types::TY_ModuleTrace:
       llvm_unreachable("Output type can never be primary output.");
     case types::TY_INVALID:
       llvm_unreachable("Invalid type ID");
@@ -768,7 +811,10 @@ ToolChain::constructInvocation(const GeneratePCHJobAction &job,
                                const JobContext &context) const {
   assert(context.Inputs.empty());
   assert(context.InputActions.size() == 1);
-  assert(context.Output.getPrimaryOutputType() == types::TY_PCH);
+  assert((!job.isPersistentPCH() &&
+            context.Output.getPrimaryOutputType() == types::TY_PCH) ||
+         (job.isPersistentPCH() &&
+            context.Output.getPrimaryOutputType() == types::TY_Nothing));
 
   ArgStringList Arguments;
 
@@ -779,10 +825,17 @@ ToolChain::constructInvocation(const GeneratePCHJobAction &job,
 
   addInputsOfType(Arguments, context.InputActions, types::TY_ObjCHeader);
 
-  Arguments.push_back("-emit-pch");
-  Arguments.push_back("-o");
-  Arguments.push_back(
-    context.Args.MakeArgString(context.Output.getPrimaryOutputFilename()));
+  if (job.isPersistentPCH()) {
+    Arguments.push_back("-emit-pch");
+    Arguments.push_back("-pch-output-dir");
+    Arguments.push_back(
+      context.Args.MakeArgString(job.getPersistentPCHDir()));
+  } else {
+    Arguments.push_back("-emit-pch");
+    Arguments.push_back("-o");
+    Arguments.push_back(
+      context.Args.MakeArgString(context.Output.getPrimaryOutputFilename()));
+  }
 
   return {SWIFT_EXECUTABLE_NAME, Arguments};
 }

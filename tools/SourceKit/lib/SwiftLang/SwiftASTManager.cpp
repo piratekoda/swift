@@ -215,7 +215,7 @@ namespace SourceKit {
   void ASTUnit::performAsync(std::function<void()> Fn) {
     Impl.Queue.dispatch(std::move(Fn));
   }
-}
+} // namespace SourceKit
 
 namespace {
 
@@ -835,7 +835,7 @@ ASTUnitRef ASTProducer::createASTUnit(SwiftASTManager::Implementation &MgrImpl,
     // don't block any other AST processing for the same SwiftInvocation.
 
     if (auto SF = CompIns.getPrimarySourceFile()) {
-      SILOptions SILOpts;
+      SILOptions SILOpts = Invocation.getSILOptions();
       std::unique_ptr<SILModule> SILMod = performSILGeneration(*SF, SILOpts);
       runSILDiagnosticPasses(*SILMod);
     }

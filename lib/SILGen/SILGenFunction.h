@@ -355,7 +355,13 @@ public:
 
   /// \brief Values to end dynamic access enforcement on.  A hack for
   /// materializeForSet.
-  SmallVectorImpl<SILValue> *ValuesToEndAccessForMaterializeForSet = nullptr;
+  struct UnpairedAccesses {
+    SILValue Buffer;
+    unsigned NumAccesses = 0; // Values besides 0 and 1 are unsupported.
+
+    explicit UnpairedAccesses(SILValue buffer) : Buffer(buffer) {}
+  };
+  UnpairedAccesses *UnpairedAccessesForMaterializeForSet = nullptr;
 
   /// VarLoc - representation of an emitted local variable or constant.  There
   /// are three scenarios here:
@@ -613,8 +619,7 @@ public:
                                   CleanupLocation cleanupLoc);
   /// Generates code for a curry thunk from one uncurry level
   /// of a function to another.
-  void emitCurryThunk(ValueDecl *fd,
-                      SILDeclRef fromLevel, SILDeclRef toLevel);
+  void emitCurryThunk(SILDeclRef thunk);
   /// Generates a thunk from a foreign function to the native Swift convention.
   void emitForeignToNativeThunk(SILDeclRef thunk);
   /// Generates a thunk from a native function to the conventions.
@@ -864,6 +869,23 @@ public:
   ManagedValue getOptionalSomeValue(SILLocation loc, ManagedValue value,
                                     const TypeLowering &optTL);
 
+  struct SourceLocArgs {
+    ManagedValue filenameStartPointer,
+                 filenameLength,
+                 filenameIsAscii,
+                 line,
+                 column;
+  };
+
+  /// Emit raw lowered arguments for a runtime diagnostic to report the given
+  /// source location:
+  /// - The first three arguments are the components necessary to construct
+  ///   a StaticString for the filename: start pointer, length, and
+  ///   "is ascii" bit.
+  /// - The fourth argument is the line number.
+  SourceLocArgs
+  emitSourceLocationArgs(SourceLoc loc, SILLocation emitLoc);
+
   /// \brief Emit a call to the library intrinsic _doesOptionalHaveValue.
   ///
   /// The result is a Builtin.Int1.
@@ -921,21 +943,6 @@ public:
                                             CanType inputTy,
                                             SILType resultTy);
 
-  /// OpenedArchetypes - Mappings of opened archetypes back to the
-  /// instruction which opened them.
-  llvm::DenseMap<ArchetypeType *, SILValue> ArchetypeOpenings;
-
-  SILValue getArchetypeOpeningSite(ArchetypeType *archetype) const {
-    auto it = ArchetypeOpenings.find(archetype);
-    assert(it != ArchetypeOpenings.end() &&
-           "opened archetype was not registered with SILGenFunction");
-    return it->second;
-  }
-
-  void setArchetypeOpeningSite(ArchetypeType *archetype, SILValue site) {
-    ArchetypeOpenings.insert({archetype, site});
-  }
-
   struct OpaqueValueState {
     ManagedValue Value;
     bool IsConsumable;
@@ -952,7 +959,7 @@ public:
   /// \param openedArchetype The opened existential archetype.
   /// \param loweredOpenedType The lowered type of the projection, which in
   /// practice will be the openedArchetype, possibly wrapped in a metatype.
-  SILGenFunction::OpaqueValueState
+  OpaqueValueState
   emitOpenExistential(SILLocation loc,
                       ManagedValue existentialValue,
                       ArchetypeType *openedArchetype,
@@ -1279,6 +1286,11 @@ public:
   ManagedValue emitAddressOfLValue(SILLocation loc, LValue &&src,
                                    AccessKind accessKind,
                                    TSanKind tsanKind = TSanKind::None);
+  LValue emitOpenExistentialLValue(SILLocation loc,
+                                   LValue &&existentialLV,
+                                   CanArchetypeType openedArchetype,
+                                   CanType formalRValueType,
+                                   AccessKind accessKind);
 
   RValue emitLoadOfLValue(SILLocation loc, LValue &&src, SGFContext C,
                           bool isGuaranteedValid = false);
@@ -1411,7 +1423,13 @@ public:
 
   /// Mapping from active opaque value expressions to their values,
   /// along with a bit for each indicating whether it has been consumed yet.
-  llvm::DenseMap<OpaqueValueExpr *, OpaqueValueState> OpaqueValues;
+  llvm::SmallDenseMap<OpaqueValueExpr *, OpaqueValueState>
+    OpaqueValues;
+
+  /// A mapping from opaque value expressions to the open-existential
+  /// expression that determines them, used while lowering lvalues.
+  llvm::SmallDenseMap<OpaqueValueExpr *, OpenExistentialExpr *>
+    OpaqueValueExprs;
 
   /// RAII object that introduces a temporary binding for an opaque value.
   ///
@@ -1505,6 +1523,13 @@ public:
   ///
   void emitBindOptional(SILLocation loc, ManagedValue optionalAddrOrValue,
                         unsigned depth);
+
+  void emitOptionalEvaluation(SILLocation loc, Type optionalType,
+                              SmallVectorImpl<ManagedValue> &results,
+                              SGFContext C,
+                      llvm::function_ref<void(SmallVectorImpl<ManagedValue> &,
+                                              SGFContext primaryC)>
+                                generateNormalResults);
 
   //===--------------------------------------------------------------------===//
   // Bridging thunks
@@ -1729,10 +1754,52 @@ public:
                             CanType baseFormalType, VarDecl *var,
                             AccessKind accessKind, AccessSemantics semantics);
 
+  struct PointerAccessInfo {
+    CanType PointerType;
+    PointerTypeKind PointerKind;
+    swift::AccessKind AccessKind;
+  };
+
+  PointerAccessInfo getPointerAccessInfo(Type pointerType);
   ManagedValue emitLValueToPointer(SILLocation loc, LValue &&lvalue,
-                                   CanType pointerType, PointerTypeKind ptrKind,
-                                   AccessKind accessKind);
-  
+                                   PointerAccessInfo accessInfo);
+
+  struct ArrayAccessInfo {
+    Type PointerType;
+    Type ArrayType;
+    swift::AccessKind AccessKind;
+  };
+  ArrayAccessInfo getArrayAccessInfo(Type pointerType, Type arrayType);
+  std::pair<ManagedValue,ManagedValue>
+  emitArrayToPointer(SILLocation loc, LValue &&lvalue,
+                     ArrayAccessInfo accessInfo);
+
+  std::pair<ManagedValue,ManagedValue>
+  emitArrayToPointer(SILLocation loc, ManagedValue arrayValue,
+                     ArrayAccessInfo accessInfo);
+
+  std::pair<ManagedValue,ManagedValue>
+  emitStringToPointer(SILLocation loc, ManagedValue stringValue,
+                      Type pointerType);
+
+  class ForceTryEmission {
+    SILGenFunction &SGF;
+    Expr *Loc;
+    JumpDest OldThrowDest;
+
+  public:
+    ForceTryEmission(SILGenFunction &SGF, Expr *loc);
+
+    ForceTryEmission(const ForceTryEmission &) = delete;
+    ForceTryEmission &operator=(const ForceTryEmission &) = delete;
+
+    void finish();
+
+    ~ForceTryEmission() {
+      if (Loc) finish();
+    }
+  };
+
   /// Return forwarding substitutions for the archetypes in the current
   /// function.
   SubstitutionList getForwardingSubstitutions();

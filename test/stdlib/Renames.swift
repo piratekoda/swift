@@ -517,7 +517,7 @@ func _StringAppend(s: inout String, u: UnicodeScalar) {
 func _StringLegacy(c: Character, u: UnicodeScalar) {
   _ = String(count: 1, repeatedValue: c) // expected-error {{'init(count:repeatedValue:)' is unavailable: Renamed to init(repeating:count:) and reordered parameters}} {{none}}
   _ = String(count: 1, repeatedValue: u) // expected-error {{'init(count:repeatedValue:)' is unavailable: Renamed to init(repeating:count:) and reordered parameters}} {{none}}
-  _ = String(repeating: c, count: 1) // expected-error {{'init(repeating:count:)' is unavailable: Replaced by init(repeating: String, count: Int)}} {{none}}
+  _ = String(repeating: c, count: 1) // no more error, since String conforms to BidirectionalCollection
   _ = String(repeating: u, count: 1) // expected-error {{'init(repeating:count:)' is unavailable: Replaced by init(repeating: String, count: Int)}} {{none}}
 }
 
@@ -536,7 +536,7 @@ func _Unicode<I : IteratorProtocol, E : UnicodeCodec>(i: I, e: E.Type) where I.E
 }
 
 func _UnicodeScalar(s: UnicodeScalar) {
-  _ = UnicodeScalar() // expected-error {{'init()' is unavailable: use 'UnicodeScalar(0)'}} {{none}}
+  _ = UnicodeScalar() // expected-error {{'init()' is unavailable: use 'Unicode.Scalar(0)'}} {{none}}
   _ = s.escape(asASCII: true) // expected-error {{'escape(asASCII:)' has been renamed to 'escaped(asASCII:)'}} {{9-15=escaped}} {{none}}
 }
 

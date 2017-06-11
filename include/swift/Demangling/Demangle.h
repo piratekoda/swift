@@ -318,7 +318,7 @@ public:
   void clear();
 };
 
-/// Standalong utility function to demangle the given symbol as string.
+/// Standalone utility function to demangle the given symbol as string.
 ///
 /// If performance is an issue when demangling multiple symbols,
 /// Context::demangleSymbolAsString should be used instead.
@@ -329,7 +329,7 @@ std::string
 demangleSymbolAsString(const char *mangledName, size_t mangledNameLength,
                        const DemangleOptions &options = DemangleOptions());
 
-/// Standalong utility function to demangle the given symbol as string.
+/// Standalone utility function to demangle the given symbol as string.
 ///
 /// If performance is an issue when demangling multiple symbols,
 /// Context::demangleSymbolAsString should be used instead.
@@ -342,7 +342,7 @@ demangleSymbolAsString(const std::string &mangledName,
                                 options);
 }
   
-/// Standalong utility function to demangle the given symbol as string.
+/// Standalone utility function to demangle the given symbol as string.
 ///
 /// If performance is an issue when demangling multiple symbols,
 /// Context::demangleSymbolAsString should be used instead.
@@ -355,7 +355,7 @@ demangleSymbolAsString(llvm::StringRef MangledName,
                                 MangledName.size(), Options);
 }
 
-/// Standalong utility function to demangle the given type as string.
+/// Standalone utility function to demangle the given type as string.
 ///
 /// If performance is an issue when demangling multiple symbols,
 /// Context::demangleTypeAsString should be used instead.
@@ -366,7 +366,7 @@ std::string
 demangleTypeAsString(const char *mangledName, size_t mangledNameLength,
                      const DemangleOptions &options = DemangleOptions());
 
-/// Standalong utility function to demangle the given type as string.
+/// Standalone utility function to demangle the given type as string.
 ///
 /// If performance is an issue when demangling multiple symbols,
 /// Context::demangleTypeAsString should be used instead.
@@ -378,7 +378,7 @@ demangleTypeAsString(const std::string &mangledName,
   return demangleTypeAsString(mangledName.data(), mangledName.size(), options);
 }
 
-/// Standalong utility function to demangle the given type as string.
+/// Standalone utility function to demangle the given type as string.
 ///
 /// If performance is an issue when demangling multiple symbols,
 /// Context::demangleTypeAsString should be used instead.
@@ -408,6 +408,12 @@ void mangleIdentifier(const char *data, size_t length,
 ///
 /// This should always round-trip perfectly with demangleSymbolAsNode.
 std::string mangleNode(const NodePointer &root);
+
+/// Remangle in the old mangling scheme.
+///
+/// This is only used for objc-runtime names and should be removed as soon as
+/// we switch to the new mangling for those names as well.
+std::string mangleNodeOld(const NodePointer &root);
 
 /// \brief Transform the node structure to a string.
 ///

@@ -24,6 +24,7 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/Demangling/ManglingUtils.h"
+#include "swift/Demangling/Demangler.h"
 #include "swift/Strings.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/AST/Attr.h"
@@ -225,6 +226,30 @@ std::string ASTMangler::mangleGlobalVariableFull(const VarDecl *decl) {
   return finalize();
 }
 
+std::string ASTMangler::mangleKeyPathGetterThunkHelper(const VarDecl *property,
+                                                   GenericSignature *signature,
+                                                   CanType baseType) {
+  beginMangling();
+  appendEntity(property);
+  if (signature)
+    appendGenericSignature(signature);
+  appendType(baseType);
+  appendOperator("TK");
+  return finalize();
+}
+
+std::string ASTMangler::mangleKeyPathSetterThunkHelper(const VarDecl *property,
+                                                   GenericSignature *signature,
+                                                   CanType baseType) {
+  beginMangling();
+  appendEntity(property);
+  if (signature)
+    appendGenericSignature(signature);
+  appendType(baseType);
+  appendOperator("Tk");
+  return finalize();
+}
+
 std::string ASTMangler::mangleGlobalInit(const VarDecl *decl, int counter,
                                          bool isInitFunc) {
   auto topLevelContext = decl->getDeclContext()->getModuleScopeContext();
@@ -287,12 +312,18 @@ std::string ASTMangler::mangleDeclType(const ValueDecl *decl) {
   return finalize();
 }
 
+#ifdef USE_NEW_MANGLING_FOR_OBJC_RUNTIME_NAMES
 static bool isPrivate(const NominalTypeDecl *Nominal) {
   return Nominal->hasAccessibility() &&
          Nominal->getFormalAccess() <= Accessibility::FilePrivate;
 }
+#endif
 
 std::string ASTMangler::mangleObjCRuntimeName(const NominalTypeDecl *Nominal) {
+#ifdef USE_NEW_MANGLING_FOR_OBJC_RUNTIME_NAMES
+  // Using the new mangling for ObjC runtime names (except for top-level
+  // classes). This is currently disabled to support old archives.
+  // TODO: re-enable this as we switch to the new mangling for ObjC names.
   DeclContext *Ctx = Nominal->getDeclContext();
 
   if (Ctx->isModuleScopeContext() && !isPrivate(Nominal)) {
@@ -324,9 +355,38 @@ std::string ASTMangler::mangleObjCRuntimeName(const NominalTypeDecl *Nominal) {
   beginMangling();
   appendAnyGenericType(Nominal);
   return finalize();
+#else
+  // Use the old mangling for ObjC runtime names.
+  beginMangling();
+  appendAnyGenericType(Nominal);
+  std::string NewName = finalize();
+  Demangle::Demangler Dem;
+  Demangle::Node *Root = Dem.demangleSymbol(NewName);
+  assert(Root->getKind() == Node::Kind::Global);
+  Node *NomTy = Root->getFirstChild();
+  if (NomTy->getKind() == Node::Kind::Protocol) {
+    // Protocols are actually mangled as protocol lists.
+    Node *PTy = Dem.createNode(Node::Kind::Type);
+    PTy->addChild(NomTy, Dem);
+    Node *TList = Dem.createNode(Node::Kind::TypeList);
+    TList->addChild(PTy, Dem);
+    NomTy = Dem.createNode(Node::Kind::ProtocolList);
+    NomTy->addChild(TList, Dem);
+  }
+  // Add a TypeMangling node at the top
+  Node *Ty = Dem.createNode(Node::Kind::Type);
+  Ty->addChild(NomTy, Dem);
+  Node *TyMangling = Dem.createNode(Node::Kind::TypeMangling);
+  TyMangling->addChild(Ty, Dem);
+  Node *NewGlobal = Dem.createNode(Node::Kind::Global);
+  NewGlobal->addChild(TyMangling, Dem);
+  std::string OldName = mangleNodeOld(NewGlobal);
+  return OldName;
+#endif
 }
 
 std::string ASTMangler::mangleTypeAsContextUSR(const NominalTypeDecl *type) {
+  beginManglingWithoutPrefix();
   llvm::SaveAndRestore<bool> allowUnnamedRAII(AllowNamelessEntities, true);
   appendContext(type);
   return finalize();
@@ -334,6 +394,7 @@ std::string ASTMangler::mangleTypeAsContextUSR(const NominalTypeDecl *type) {
 
 std::string ASTMangler::mangleDeclAsUSR(const ValueDecl *Decl,
                                         StringRef USRPrefix) {
+  beginManglingWithoutPrefix();
   llvm::SaveAndRestore<bool> allowUnnamedRAII(AllowNamelessEntities, true);
   Buffer << USRPrefix;
   bindGenericParameters(Decl->getDeclContext());
@@ -360,6 +421,7 @@ std::string ASTMangler::mangleAccessorEntityAsUSR(AccessorKind kind,
                                                   AddressorKind addressorKind,
                                                   const ValueDecl *decl,
                                                   StringRef USRPrefix) {
+  beginManglingWithoutPrefix();
   llvm::SaveAndRestore<bool> allowUnnamedRAII(AllowNamelessEntities, true);
   Buffer << USRPrefix;
   appendAccessorEntity(kind, addressorKind, decl, /*isStatic*/ false);
@@ -439,9 +501,33 @@ static unsigned getUnnamedParamIndex(const ParamDecl *D) {
   llvm_unreachable("param not found");
 }
 
+static StringRef getPrivateDiscriminatorIfNecessary(const ValueDecl *decl) {
+  if (!decl->hasAccessibility() ||
+      decl->getFormalAccess() > Accessibility::FilePrivate ||
+      isInPrivateOrLocalContext(decl)) {
+    return StringRef();
+  }
+
+  // Mangle non-local private declarations with a textual discriminator
+  // based on their enclosing file.
+  auto topLevelContext = decl->getDeclContext()->getModuleScopeContext();
+  auto fileUnit = cast<FileUnit>(topLevelContext);
+
+  Identifier discriminator =
+      fileUnit->getDiscriminatorForPrivateValue(decl);
+  assert(!discriminator.empty());
+  assert(!isNonAscii(discriminator.str()) &&
+         "discriminator contains non-ASCII characters");
+  (void)&isNonAscii;
+  assert(!clang::isDigit(discriminator.str().front()) &&
+         "not a valid identifier");
+  return discriminator.str();
+}
+
 void ASTMangler::appendDeclName(const ValueDecl *decl) {
   if (decl->isOperator()) {
-    appendIdentifier(translateOperator(decl->getName().str()));
+    auto name = decl->getBaseName().getIdentifier().str();
+    appendIdentifier(translateOperator(name));
     switch (decl->getAttrs().getUnaryOperatorKind()) {
       case UnaryOperatorKind::Prefix:
         appendOperator("op");
@@ -454,7 +540,8 @@ void ASTMangler::appendDeclName(const ValueDecl *decl) {
         break;
     }
   } else if (decl->hasName()) {
-    appendIdentifier(decl->getName().str());
+    // TODO: Handle special names
+    appendIdentifier(decl->getBaseName().getIdentifier().str());
   } else {
     assert(AllowNamelessEntities && "attempt to mangle unnamed decl");
     // Fall back to an unlikely name, so that we still generate a valid
@@ -472,27 +559,10 @@ void ASTMangler::appendDeclName(const ValueDecl *decl) {
     // Mangle local declarations with a numeric discriminator.
     return appendOperator("L", Index(decl->getLocalDiscriminator()));
   }
-  if (decl->hasAccessibility() &&
-      decl->getFormalAccess() <= Accessibility::FilePrivate &&
-      !isInPrivateOrLocalContext(decl)) {
-    // Mangle non-local private declarations with a textual discriminator
-    // based on their enclosing file.
 
-    // The first <identifier> is a discriminator string unique to the decl's
-    // original source file.
-    auto topLevelContext = decl->getDeclContext()->getModuleScopeContext();
-    auto fileUnit = cast<FileUnit>(topLevelContext);
-
-    Identifier discriminator =
-      fileUnit->getDiscriminatorForPrivateValue(decl);
-    assert(!discriminator.empty());
-    assert(!isNonAscii(discriminator.str()) &&
-           "discriminator contains non-ASCII characters");
-    (void)&isNonAscii;
-    assert(!clang::isDigit(discriminator.str().front()) &&
-           "not a valid identifier");
-
-    appendIdentifier(discriminator.str());
+  StringRef privateDiscriminator = getPrivateDiscriminatorIfNecessary(decl);
+  if (!privateDiscriminator.empty()) {
+    appendIdentifier(privateDiscriminator.str());
     return appendOperator("LL");
   }
 }
@@ -666,7 +736,7 @@ void ASTMangler::appendType(Type type) {
       if (layout.superclass) {
         appendType(layout.superclass);
         return appendOperator("Xc");
-      } else if (layout.requiresClass & !layout.requiresClassImplied) {
+      } else if (layout.hasExplicitAnyObject) {
         return appendOperator("Xl");
       }
       return appendOperator("p");
@@ -933,6 +1003,8 @@ static char getParamConvention(ParameterConvention conv) {
   // different places.
   switch (conv) {
     case ParameterConvention::Indirect_In: return 'i';
+    case ParameterConvention::Indirect_In_Constant:
+      return 'c';
     case ParameterConvention::Indirect_Inout: return 'l';
     case ParameterConvention::Indirect_InoutAliasable: return 'b';
     case ParameterConvention::Indirect_In_Guaranteed: return 'n';
@@ -1032,7 +1104,7 @@ void ASTMangler::appendContextOf(const ValueDecl *decl) {
            isa<clang::TypedefDecl>(clangDecl));
     return appendOperator("So");
   }
-  
+
   if (isa<ProtocolDecl>(decl) && clangDecl) {
     assert(isa<clang::ObjCProtocolDecl>(clangDecl));
     return appendOperator("So");
@@ -1344,11 +1416,13 @@ void ASTMangler::appendParams(Type ParamsTy, bool forceSingleParam) {
     if (Tuple->getNumElements() == 0) {
       if (forceSingleParam) {
         // A tuple containing a single empty tuple.
+        appendOperator("y");
         appendOperator("t");
         appendListSeparator();
         appendOperator("t");
+      } else {
+        appendOperator("y");
       }
-      appendOperator("y");
       return;
     }
     if (forceSingleParam && Tuple->getNumElements() > 1) {
@@ -1684,14 +1758,19 @@ void ASTMangler::appendDeclType(const ValueDecl *decl, bool isFunctionMangling) 
                                      requirements, requirementsBuf);
  
   if (AnyFunctionType *FuncTy = type->getAs<AnyFunctionType>()) {
-    bool forceSingleParam = false;
+
+    const ParameterList *Params = nullptr;
     if (const auto *FDecl = dyn_cast<AbstractFunctionDecl>(decl)) {
       unsigned PListIdx = isMethodDecl(decl) ? 1 : 0;
       if (PListIdx < FDecl->getNumParameterLists()) {
-        const ParameterList *Params = FDecl->getParameterList(PListIdx);
-        forceSingleParam = (Params->size() == 1);
+        Params = FDecl->getParameterList(PListIdx);
       }
+    } else if (const auto *SDecl = dyn_cast<SubscriptDecl>(decl)) {
+        Params = SDecl->getIndices();
     }
+    bool forceSingleParam = Params && (Params->size() == 1);
+          
+
     if (isFunctionMangling) {
       appendFunctionSignature(FuncTy, forceSingleParam);
     } else {
@@ -1729,6 +1808,11 @@ void ASTMangler::appendConstructorEntity(const ConstructorDecl *ctor,
                                          bool isAllocating) {
   appendContextOf(ctor);
   appendDeclType(ctor);
+  StringRef privateDiscriminator = getPrivateDiscriminatorIfNecessary(ctor);
+  if (!privateDiscriminator.empty()) {
+    appendIdentifier(privateDiscriminator);
+    appendOperator("Ll");
+  }
   appendOperator(isAllocating ? "fC" : "fc");
 }
 
@@ -1837,9 +1921,12 @@ void ASTMangler::appendProtocolConformance(const ProtocolConformance *conformanc
     appendIdentifier(
               fileUnit->getDiscriminatorForPrivateValue(behaviorStorage).str());
     appendProtocolName(conformance->getProtocol());
-    appendIdentifier(behaviorStorage->getName().str());
+    appendIdentifier(behaviorStorage->getBaseName().getIdentifier().str());
   } else {
-    appendType(conformance->getInterfaceType()->getCanonicalType());
+    auto conformanceDC = conformance->getDeclContext();
+    auto conformingType =
+      conformanceDC->mapTypeOutOfContext(conformance->getType());
+    appendType(conformingType->getCanonicalType());
     appendProtocolName(conformance->getProtocol());
     appendModule(conformance->getDeclContext()->getParentModule());
   }

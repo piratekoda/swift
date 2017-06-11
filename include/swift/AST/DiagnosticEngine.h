@@ -18,6 +18,7 @@
 #ifndef SWIFT_BASIC_DIAGNOSTICENGINE_H
 #define SWIFT_BASIC_DIAGNOSTICENGINE_H
 
+#include "swift/AST/Attr.h"
 #include "swift/AST/TypeLoc.h"
 #include "swift/AST/DeclNameLoc.h"
 #include "swift/AST/DiagnosticConsumer.h"
@@ -740,6 +741,10 @@ namespace swift {
     /// \returns true if diagnostic is marked with PointsToFirstBadToken
     /// option.
     bool isDiagnosticPointsToFirstBadToken(DiagID id) const;
+
+    /// \returns true if any diagnostic consumer gave an error while invoking
+    //// \c finishProcessing.
+    bool finishProcessing();
     
     /// \brief Format the given diagnostic text and place the result in the given
     /// buffer.

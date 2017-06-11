@@ -72,10 +72,8 @@ void Solution::computeSubstitutions(
     return;
 
   TypeSubstitutionMap subs;
-  for (const auto &opened : openedTypes->second) {
-    subs[opened.first->castTo<GenericTypeParamType>()] =
-      getFixedType(opened.second);
-  }
+  for (const auto &opened : openedTypes->second)
+    subs[opened.first] = getFixedType(opened.second);
 
   auto &tc = getConstraintSystem().getTypeChecker();
 
@@ -95,8 +93,11 @@ void Solution::computeSubstitutions(
                                   ConformanceCheckFlags::Used));
   };
 
-  sig->getSubstitutions(QueryTypeSubstitutionMap{subs},
-                        lookupConformanceFn, result);
+  auto subMap = sig->getSubstitutionMap(
+    QueryTypeSubstitutionMap{subs},
+    lookupConformanceFn);
+
+  sig->getSubstitutions(subMap, result);
 }
 
 void Solution::computeSubstitutions(
@@ -166,7 +167,7 @@ static DeclTy *findNamedWitnessImpl(
     return requirement;
   auto concrete = conformance->getConcrete();
   // FIXME: Dropping substitutions here.
-  return cast_or_null<DeclTy>(concrete->getWitness(requirement, &tc).getDecl());
+  return cast_or_null<DeclTy>(concrete->getWitnessDecl(requirement, &tc));
 }
 
 static bool shouldAccessStorageDirectly(Expr *base, VarDecl *member,
@@ -258,18 +259,65 @@ void ConstraintSystem::propagateLValueAccessKind(Expr *E,
                                allowOverwrite);
 }
 
-bool ConstraintSystem::isTypeReference(Expr *E) {
+bool ConstraintSystem::isTypeReference(const Expr *E) {
   return E->isTypeReference([&](const Expr *E) -> Type { return getType(E); });
 }
 
-bool ConstraintSystem::isStaticallyDerivedMetatype(Expr *E) {
+bool ConstraintSystem::isStaticallyDerivedMetatype(const Expr *E) {
   return E->isStaticallyDerivedMetatype(
       [&](const Expr *E) -> Type { return getType(E); });
 }
 
-Type ConstraintSystem::getInstanceType(TypeExpr *E) {
+Type ConstraintSystem::getInstanceType(const TypeExpr *E) {
   return E->getInstanceType([&](const Expr *E) -> bool { return hasType(E); },
                             [&](const Expr *E) -> Type { return getType(E); });
+}
+
+Type ConstraintSystem::getResultType(const AbstractClosureExpr *E) {
+  return E->getResultType([&](const Expr *E) -> Type { return getType(E); });
+}
+
+static bool buildObjCKeyPathString(KeyPathExpr *E,
+                                   llvm::SmallVectorImpl<char> &buf) {
+  for (auto &component : E->getComponents()) {
+    switch (component.getKind()) {
+    case KeyPathExpr::Component::Kind::OptionalChain:
+    case KeyPathExpr::Component::Kind::OptionalForce:
+    case KeyPathExpr::Component::Kind::OptionalWrap:
+      // KVC propagates nulls, so these don't affect the key path string.
+      continue;
+      
+    case KeyPathExpr::Component::Kind::Property: {
+      // Property references must be to @objc properties.
+      // TODO: If we added special properties matching KVC operators like '@sum',
+      // '@count', etc. those could be mapped too.
+      auto property = cast<VarDecl>(component.getDeclRef().getDecl());
+      if (!property->isObjC())
+        return false;
+      if (!buf.empty()) {
+        buf.push_back('.');
+      }
+      auto objcName = property->getObjCPropertyName().str();
+      buf.append(objcName.begin(), objcName.end());
+      continue;
+    }
+    case KeyPathExpr::Component::Kind::Subscript: {
+      // Subscripts aren't generally represented in KVC.
+      // TODO: There are some subscript forms we could map to KVC, such as
+      // when indexing a Dictionary or NSDictionary by string, or when applying
+      // a mapping subscript operation to Array/Set or NSArray/NSSet.
+      return false;
+    case KeyPathExpr::Component::Kind::Invalid:
+    case KeyPathExpr::Component::Kind::UnresolvedProperty:
+    case KeyPathExpr::Component::Kind::UnresolvedSubscript:
+      // Don't bother building the key path string if the key path didn't even
+      // resolve.
+      return false;
+    }
+    }
+  }
+  
+  return true;
 }
 
 namespace {
@@ -395,8 +443,7 @@ namespace {
   public:
     /// \brief Build a reference to the given declaration.
     Expr *buildDeclRef(ValueDecl *decl, DeclNameLoc loc, Type openedType,
-                       ConstraintLocatorBuilder locator,
-                       bool specialized, bool implicit,
+                       ConstraintLocatorBuilder locator, bool implicit,
                        FunctionRefKind functionRefKind,
                        AccessSemantics semantics) {
       // Determine the declaration selected for this overloaded reference.
@@ -426,8 +473,8 @@ namespace {
                                     (ConformanceCheckFlags::InExpression|
                                          ConformanceCheckFlags::Used));
             if (conformance && conformance->isConcrete()) {
-              if (auto witnessRef =
-                    conformance->getConcrete()->getWitness(decl, &tc)) {
+              if (auto witness =
+                        conformance->getConcrete()->getWitnessDecl(decl, &tc)) {
                 // Hack up an AST that we can type-check (independently) to get
                 // it into the right form.
                 // FIXME: the hop through 'getDecl()' is because
@@ -435,7 +482,6 @@ namespace {
                 // witnesses' ConcreteDeclRefs.
                 Type expectedFnType = simplifiedFnType->getResult();
                 Expr *refExpr;
-                ValueDecl *witness = witnessRef.getDecl();
                 if (witness->getDeclContext()->isTypeContext()) {
                   Expr *base =
                     TypeExpr::createImplicitHack(loc.getBaseNameLoc(), baseTy,
@@ -664,7 +710,8 @@ namespace {
       // better SILGen.
       if (isLValue &&
           (isNonMutatingMember(member) ||
-           isMetatype || baseTy->isClassExistentialType())) {
+           member->getDeclContext()->getDeclaredTypeOfContext()
+             ->hasReferenceSemantics())) {
         base = cs.coerceToRValue(base);
         isLValue = false;
       }
@@ -717,6 +764,12 @@ namespace {
         if (result == nullptr) {
           result = new (tc.Context) ErrorExpr(range);
           cs.setType(result, erasedTy);
+          // The opaque value is no longer reachable in an AST walk as
+          // a result of the result above being replaced with an
+          // ErrorExpr, but there is code expecting to have a type set
+          // on it. Since we no longer have a reachable reference,
+          // we'll null this out.
+          record.OpaqueValue = nullptr;
         }
       }
 
@@ -725,7 +778,7 @@ namespace {
       // means this is our only chance to propagate the l-value access kind
       // down to the original existential value.  Otherwise, propagateLVAK
       // will handle this.
-      if (record.OpaqueValue->hasLValueAccessKind())
+      if (record.OpaqueValue && record.OpaqueValue->hasLValueAccessKind())
         cs.propagateLValueAccessKind(record.ExistentialValue,
                                   record.OpaqueValue->getLValueAccessKind());
 
@@ -856,18 +909,19 @@ namespace {
 
         // If the base is already an lvalue with the right base type, we can
         // pass it as an inout qualified type.
-        auto selfParamTy = selfTy;
+        auto selfParamTy = isDynamic ? selfTy : containerTy;
 
         if (selfTy->isEqual(baseTy))
           if (cs.getType(base)->is<LValueType>())
             selfParamTy = InOutType::get(selfTy);
+
         base = coerceObjectArgumentToType(
                  base, selfParamTy, member, semantics,
                  locator.withPathElement(ConstraintLocator::MemberRefBase));
       } else {
         // Convert the base to an rvalue of the appropriate metatype.
         base = coerceToType(base,
-                            MetatypeType::get(selfTy),
+                            MetatypeType::get(isDynamic ? selfTy : containerTy),
                             locator.withPathElement(
                               ConstraintLocator::MemberRefBase));
         if (!base)
@@ -904,7 +958,8 @@ namespace {
         // complain.
         if (auto attr = member->getAttrs().getAttribute<ObjCAttr>()) {
           if (attr->isSwift3Inferred() &&
-              !tc.Context.LangOpts.WarnSwift3ObjCInference) {
+              tc.Context.LangOpts.WarnSwift3ObjCInference
+                == Swift3ObjCInferenceWarnings::Minimal) {
             tc.diagnose(memberLoc,
                         diag::expr_dynamic_lookup_swift3_objc_inference,
                         member->getDescriptiveKind(),
@@ -1254,6 +1309,72 @@ namespace {
       }
 
       auto choice = selected->choice;
+      
+      // Apply a key path if we have one.
+      if (choice.getKind() == OverloadChoiceKind::KeyPathApplication) {
+        // The index argument should be (keyPath: KeyPath<Root, Value>).
+        auto keyPathTTy = cs.getType(index)->castTo<TupleType>()
+          ->getElementType(0);
+        
+        Type valueTy;
+        bool resultIsLValue;
+        
+        if (auto nom = keyPathTTy->getAs<NominalType>()) {
+          // AnyKeyPath is <T> rvalue T -> rvalue Any?
+          if (nom->getDecl() == cs.getASTContext().getAnyKeyPathDecl()) {
+            valueTy = ProtocolCompositionType::get(cs.getASTContext(), {},
+                                                  /*explicit anyobject*/ false);
+            valueTy = OptionalType::get(valueTy);
+            resultIsLValue = false;
+            base = cs.coerceToRValue(base);
+          } else {
+            llvm_unreachable("unknown key path class!");
+          }
+        } else {
+          auto keyPathBGT = keyPathTTy->castTo<BoundGenericType>();
+          
+          if (keyPathBGT->getDecl()
+                == cs.getASTContext().getPartialKeyPathDecl()) {
+            // PartialKeyPath<T> is rvalue T -> rvalue Any
+            valueTy = ProtocolCompositionType::get(cs.getASTContext(), {},
+                                                 /*explicit anyobject*/ false);
+            resultIsLValue = false;
+            base = cs.coerceToRValue(base);
+          } else {
+            // *KeyPath<T, U> is T -> U, with rvalueness based on mutability
+            // of base and keypath
+            valueTy = keyPathBGT->getGenericArgs()[1];
+        
+            // The result may be an lvalue based on the base and key path kind.
+            if (keyPathBGT->getDecl() == cs.getASTContext().getKeyPathDecl()) {
+              resultIsLValue = false;
+              base = cs.coerceToRValue(base);
+            } else if (keyPathBGT->getDecl() ==
+                         cs.getASTContext().getWritableKeyPathDecl()) {
+              resultIsLValue = cs.getType(base)->isLValueType();
+            } else if (keyPathBGT->getDecl() ==
+                       cs.getASTContext().getReferenceWritableKeyPathDecl()) {
+              resultIsLValue = true;
+              base = cs.coerceToRValue(base);
+            } else {
+              llvm_unreachable("unknown key path class!");
+            }
+          }
+        }
+        if (resultIsLValue)
+          valueTy = LValueType::get(valueTy);
+        
+        // Dig the key path expression out of the argument tuple.
+        auto indexKP = cast<TupleExpr>(index)->getElement(0);
+        
+        auto keyPathAp = new (cs.getASTContext())
+           KeyPathApplicationExpr(base, index->getStartLoc(), indexKP,
+                                  index->getEndLoc(), valueTy,
+                                  base->isImplicit() && index->isImplicit());
+        cs.setType(keyPathAp, valueTy);
+        return keyPathAp;
+      }
+      
       auto subscript = cast<SubscriptDecl>(choice.getDecl());
 
       auto &tc = cs.getTypeChecker();
@@ -1269,8 +1390,6 @@ namespace {
       }
 
       // Figure out the index and result types.
-      auto containerTy
-        = subscript->getDeclContext()->getDeclaredTypeOfContext();
       auto subscriptTy = simplifyType(selected->openedType);
       auto indexTy = subscriptTy->castTo<AnyFunctionType>()->getInput();
       auto resultTy = subscriptTy->castTo<AnyFunctionType>()->getResult();
@@ -1284,7 +1403,6 @@ namespace {
       if (knownOpened != solution.OpenedExistentialTypes.end()) {
         base = openExistentialReference(base, knownOpened->second, subscript);
         baseTy = knownOpened->second;
-        containerTy = baseTy;
       }
 
       // Coerce the index argument.
@@ -1329,7 +1447,7 @@ namespace {
       // Convert the base.
       auto openedFullFnType = selected->openedFullType->castTo<FunctionType>();
       auto openedBaseType = openedFullFnType->getInput();
-      containerTy = solution.simplifyType(openedBaseType);
+      auto containerTy = solution.simplifyType(openedBaseType);
       base = coerceObjectArgumentToType(
         base, containerTy, subscript, AccessSemantics::Ordinary,
         locator.withPathElement(ConstraintLocator::MemberRefBase));
@@ -1614,7 +1732,7 @@ namespace {
 
       // Form the arguments.
       Expr *args[2] = {
-        cs.cacheType(object),
+        object,
         cs.cacheType(
             new (tc.Context) DotSelfExpr(
                 TypeExpr::createImplicitHack(object->getLoc(),
@@ -2040,6 +2158,26 @@ namespace {
             diag::extended_grapheme_cluster_literal_broken_proto;
         brokenBuiltinProtocolDiag =
             diag::builtin_extended_grapheme_cluster_literal_broken_proto;
+
+        auto *builtinUTF16ExtendedGraphemeClusterProtocol = tc.getProtocol(
+            expr->getLoc(),
+            KnownProtocolKind::ExpressibleByBuiltinUTF16ExtendedGraphemeClusterLiteral);
+        if (tc.conformsToProtocol(type,
+                                  builtinUTF16ExtendedGraphemeClusterProtocol,
+                                  cs.DC, ConformanceCheckFlags::InExpression)) {
+          builtinLiteralFuncName
+            = DeclName(tc.Context, tc.Context.Id_init,
+                       { tc.Context.Id_builtinExtendedGraphemeClusterLiteral,
+                         tc.Context.getIdentifier("utf16CodeUnitCount") });
+
+          builtinProtocol = builtinUTF16ExtendedGraphemeClusterProtocol;
+          brokenBuiltinProtocolDiag =
+            diag::builtin_utf16_extended_grapheme_cluster_literal_broken_proto;
+          if (stringLiteral)
+            stringLiteral->setEncoding(StringLiteralExpr::UTF16);
+          else
+            magicLiteral->setStringEncoding(StringLiteralExpr::UTF16);
+        }
       } else {
         // Otherwise, we should have just one Unicode scalar.
         literalType = tc.Context.Id_UnicodeScalarLiteralType;
@@ -2262,7 +2400,7 @@ namespace {
       // FIXME: Cannibalize the existing DeclRefExpr rather than allocating a
       // new one?
       return buildDeclRef(decl, expr->getNameLoc(), selected->openedFullType,
-                          locator, expr->isSpecialized(),
+                          locator,
                           expr->isImplicit(),
                           expr->getFunctionRefKind(),
                           expr->getAccessSemantics());
@@ -2282,7 +2420,6 @@ namespace {
     }
 
     Expr *visitOtherConstructorDeclRefExpr(OtherConstructorDeclRefExpr *expr) {
-      assert(!expr->getDeclRef().isSpecialized());
       cs.setType(expr, expr->getDecl()->getInitializerInterfaceType());
       return expr;
     }
@@ -2299,7 +2436,7 @@ namespace {
       auto decl = choice.getDecl();
 
       return buildDeclRef(decl, expr->getNameLoc(), selected.openedFullType,
-                          locator, expr->isSpecialized(), expr->isImplicit(),
+                          locator, expr->isImplicit(),
                           choice.getFunctionRefKind(),
                           AccessSemantics::Ordinary);
     }
@@ -2312,16 +2449,6 @@ namespace {
 
     Expr *visitUnresolvedSpecializeExpr(UnresolvedSpecializeExpr *expr) {
       // Our specializations should have resolved the subexpr to the right type.
-      if (auto DRE = dyn_cast<DeclRefExpr>(expr->getSubExpr())) {
-        assert(DRE->getGenericArgs().empty() ||
-            DRE->getGenericArgs().size() == expr->getUnresolvedParams().size());
-        if (DRE->getGenericArgs().empty()) {
-          SmallVector<TypeRepr *, 8> GenArgs;
-          for (auto TL : expr->getUnresolvedParams())
-            GenArgs.push_back(TL.getTypeRepr());
-          DRE->setGenericArgs(GenArgs);
-        }
-      }
       return expr->getSubExpr();
     }
 
@@ -2454,7 +2581,7 @@ namespace {
         bool diagnoseBadInitRef = true;
         auto arg = base->getSemanticsProvidingExpr();
         if (auto dre = dyn_cast<DeclRefExpr>(arg)) {
-          if (dre->getDecl()->getName() == cs.getASTContext().Id_self) {
+          if (dre->getDecl()->getFullName() == cs.getASTContext().Id_self) {
             // We have a reference to 'self'.
             diagnoseBadInitRef = false;
 
@@ -2603,12 +2730,11 @@ namespace {
       }
 
       case OverloadChoiceKind::BaseType: {
-        // FIXME: Losing ".0" sugar here.
         return base;
       }
 
-      case OverloadChoiceKind::TypeDecl:
-        llvm_unreachable("Nonsensical overload choice");
+      case OverloadChoiceKind::KeyPathApplication:
+        llvm_unreachable("should only happen in a subscript");
       }
 
     llvm_unreachable("Unhandled OverloadChoiceKind in switch.");
@@ -2720,8 +2846,10 @@ namespace {
                             /*Implicit=*/true,
                             argType);
 
-      cs.cacheExprTypes(typeRef);
+      cs.cacheExprTypes(arg);
+
       cs.setExprTypes(typeRef);
+      cs.setExprTypes(arg);
 
       Expr *result = tc.callWitness(typeRef, dc, arrayProto, *conformance,
                                     name, arg, diag::array_protocol_broken);
@@ -2800,8 +2928,10 @@ namespace {
                               /*Implicit=*/false,
                               argType);
 
-      cs.cacheExprTypes(typeRef);
+      cs.cacheExprTypes(arg);
+
       cs.setExprTypes(typeRef);
+      cs.setExprTypes(arg);
 
       Expr *result = tc.callWitness(typeRef, dc, dictionaryProto,
                                     *conformance, name, arg,
@@ -3515,7 +3645,7 @@ namespace {
       // already.
       Expr *simplified = simplifyExprType(expr);
       if (!SuppressDiagnostics
-          && !simplified->getType()->is<UnresolvedType>()) {
+          && !cs.getType(simplified)->is<UnresolvedType>()) {
         cs.TC.diagnose(simplified->getLoc(), diag::pattern_in_expr,
                        expr->getSubPattern()->getKind());
       }
@@ -3577,6 +3707,10 @@ namespace {
     }
     
     Expr *visitMakeTemporarilyEscapableExpr(MakeTemporarilyEscapableExpr *expr){
+      llvm_unreachable("Already type-checked");
+    }
+
+    Expr *visitKeyPathApplicationExpr(KeyPathApplicationExpr *expr){
       llvm_unreachable("Already type-checked");
     }
     
@@ -3870,7 +4004,8 @@ namespace {
         // If this attribute was inferred based on deprecated Swift 3 rules,
         // complain.
         if (attr->isSwift3Inferred() &&
-            !tc.Context.LangOpts.WarnSwift3ObjCInference) {
+            tc.Context.LangOpts.WarnSwift3ObjCInference
+              == Swift3ObjCInferenceWarnings::Minimal) {
           tc.diagnose(E->getLoc(), diag::expr_selector_swift3_objc_inference,
                       foundDecl->getDescriptiveKind(), foundDecl->getFullName(),
                       foundDecl->getDeclContext()
@@ -3889,11 +4024,216 @@ namespace {
       return E;
     }
 
-    Expr *visitObjCKeyPathExpr(ObjCKeyPathExpr *E) {
-      if (auto semanticE = E->getSemanticExpr())
-        cs.setType(E, cs.getType(semanticE));
+    Expr *visitKeyPathExpr(KeyPathExpr *E) {
+      if (E->isObjC()) {
+        cs.setType(E, cs.getType(E->getObjCStringLiteralExpr()));
+        return E;
+      }
 
+      simplifyExprType(E);
+      
+      if (cs.getType(E)->hasError())
+        return E;
+
+      // If a component is already resolved, then all of them should be
+      // resolved, and we can let the expression be. This might happen when
+      // re-checking a failed system for diagnostics.
+      if (!E->getComponents().empty()
+          && E->getComponents().front().isResolved()) {
+        assert([&]{
+          for (auto &c : E->getComponents())
+            if (!c.isResolved())
+              return false;
+          return true;
+        }());
+        return E;
+      }
+
+      SmallVector<KeyPathExpr::Component, 4> resolvedComponents;
+
+      // Resolve each of the components.
+      bool didOptionalChain = false;
+      auto keyPathTy = cs.getType(E)->castTo<BoundGenericType>();
+      Type baseTy = keyPathTy->getGenericArgs()[0];
+      Type leafTy = keyPathTy->getGenericArgs()[1];
+      
+      for (unsigned i : indices(E->getComponents())) {
+        auto &origComponent = E->getComponents()[i];
+        
+        // If there were unresolved types, we may end up with a null base for
+        // following components.
+        if (!baseTy) {
+          resolvedComponents.push_back(origComponent);
+          continue;
+        }
+        
+        KeyPathExpr::Component component;
+        switch (auto kind = origComponent.getKind()) {
+        case KeyPathExpr::Component::Kind::UnresolvedProperty: {
+          auto locator = cs.getConstraintLocator(E,
+                       ConstraintLocator::PathElement::getKeyPathComponent(i));
+          auto foundDecl = getOverloadChoiceIfAvailable(locator);
+          // Leave the component unresolved if the overload was not resolved.
+          if (!foundDecl) {
+            component = origComponent;
+            break;
+          }
+          auto property = foundDecl->choice.getDecl();
+          
+          // Key paths can only refer to properties currently.
+          if (!isa<VarDecl>(property)) {
+            cs.TC.diagnose(origComponent.getLoc(),
+                           diag::expr_keypath_not_property,
+                           property->getDescriptiveKind(),
+                           property->getFullName());
+          } else {
+            // Key paths don't work with mutating-get properties.
+            auto varDecl = cast<VarDecl>(property);
+            if (varDecl->hasAccessorFunctions()
+                && varDecl->getGetter()->isMutating()) {
+              cs.TC.diagnose(origComponent.getLoc(),
+                             diag::expr_keypath_mutating_getter,
+                             property->getFullName());
+            }
+          }
+          
+          auto dc = property->getInnermostDeclContext();
+          SmallVector<Substitution, 4> subs;
+          if (auto sig = dc->getGenericSignatureOfContext()) {
+            // Compute substitutions to refer to the member.
+            solution.computeSubstitutions(sig, locator, subs);
+          }
+          
+          auto resolvedTy = foundDecl->openedType;
+          resolvedTy = simplifyType(resolvedTy);
+          
+          auto ref = ConcreteDeclRef(cs.getASTContext(), property, subs);
+          component = KeyPathExpr::Component::forProperty(ref,
+                                                       resolvedTy,
+                                                       origComponent.getLoc());
+          break;
+        }
+        case KeyPathExpr::Component::Kind::UnresolvedSubscript: {
+          auto locator = cs.getConstraintLocator(E,
+                       ConstraintLocator::PathElement::getKeyPathComponent(i));
+          auto foundDecl = getOverloadChoiceIfAvailable(locator);
+          // Leave the component unresolved if the overload was not resolved.
+          if (!foundDecl) {
+            component = origComponent;
+            break;
+          }
+          auto subscript = cast<SubscriptDecl>(foundDecl->choice.getDecl());
+          if (subscript->getGetter()->isMutating()) {
+            cs.TC.diagnose(origComponent.getLoc(),
+                           diag::expr_keypath_mutating_getter,
+                           subscript->getFullName());
+          }
+          
+          auto dc = subscript->getInnermostDeclContext();
+          SmallVector<Substitution, 4> subs;
+          if (auto sig = dc->getGenericSignatureOfContext()) {
+            // Compute substitutions to refer to the member.
+            solution.computeSubstitutions(sig, locator, subs);
+          }
+          
+          auto resolvedTy = foundDecl->openedType->castTo<AnyFunctionType>()
+            ->getResult();
+          resolvedTy = simplifyType(resolvedTy);
+          
+          auto ref = ConcreteDeclRef(cs.getASTContext(), subscript, subs);
+          component = KeyPathExpr::Component
+            ::forSubscriptWithPrebuiltIndexExpr(ref,
+                                                origComponent.getIndexExpr(),
+                                                resolvedTy,
+                                                origComponent.getLoc());
+          break;
+        }
+        case KeyPathExpr::Component::Kind::OptionalChain: {
+          didOptionalChain = true;
+          // Chaining always forces the element to be an rvalue.
+          auto objectTy = baseTy->getLValueOrInOutObjectType()
+            ->getAnyOptionalObjectType();
+          if (baseTy->hasUnresolvedType() && !objectTy) {
+            objectTy = baseTy;
+          }
+          assert(objectTy);
+          
+          component = KeyPathExpr::Component::forOptionalChain(objectTy,
+                                                        origComponent.getLoc());
+          break;
+        }
+        case KeyPathExpr::Component::Kind::OptionalForce: {
+          Type objectTy;
+          if (auto lvalue = baseTy->getAs<LValueType>()) {
+            objectTy = lvalue->getObjectType()->getAnyOptionalObjectType();
+            if (baseTy->hasUnresolvedType() && !objectTy) {
+              objectTy = baseTy;
+            }
+            objectTy = LValueType::get(objectTy);
+          } else {
+            objectTy = baseTy->getAnyOptionalObjectType();
+            if (baseTy->hasUnresolvedType() && !objectTy) {
+              objectTy = baseTy;
+            }
+            assert(objectTy);
+          }
+          
+          component = KeyPathExpr::Component::forOptionalForce(objectTy,
+                                                        origComponent.getLoc());
+          break;
+        }
+        case KeyPathExpr::Component::Kind::Invalid:
+          component = origComponent;
+          component.setComponentType(leafTy);
+          break;
+          
+        case KeyPathExpr::Component::Kind::Property:
+        case KeyPathExpr::Component::Kind::Subscript:
+        case KeyPathExpr::Component::Kind::OptionalWrap:
+          llvm_unreachable("already resolved");
+        }
+
+        baseTy = component.getComponentType();
+        resolvedComponents.push_back(component);
+      }
+      
+      // Wrap a non-optional result if there was chaining involved.
+      if (didOptionalChain &&
+          baseTy &&
+          !baseTy->hasUnresolvedType() &&
+          !baseTy->isEqual(leafTy)) {
+        assert(leafTy->getAnyOptionalObjectType()->isEqual(baseTy));
+        auto component = KeyPathExpr::Component::forOptionalWrap(leafTy);
+        resolvedComponents.push_back(component);
+        baseTy = leafTy;
+      }
+      E->resolveComponents(cs.getASTContext(), resolvedComponents);
+      
+      // See whether there's an equivalent ObjC key path string we can produce
+      // for interop purposes.
+      if (cs.getASTContext().LangOpts.EnableObjCInterop) {
+        SmallString<64> compatStringBuf;
+        if (buildObjCKeyPathString(E, compatStringBuf)) {
+          auto stringCopy =
+            cs.getASTContext().AllocateCopy<char>(compatStringBuf.begin(),
+                                                  compatStringBuf.end());
+          auto stringExpr = new (cs.getASTContext()) StringLiteralExpr(
+                                 StringRef(stringCopy, compatStringBuf.size()),
+                                 SourceRange(),
+                                 /*implicit*/ true);
+          cs.setType(stringExpr, cs.getType(E));
+          E->setObjCStringLiteralExpr(stringExpr);
+        }
+      }
+      
+      // The final component type ought to line up with the leaf type of the
+      // key path.
+      assert(!baseTy || baseTy->getLValueOrInOutObjectType()->isEqual(leafTy));
       return E;
+    }
+
+    Expr *visitKeyPathDotExpr(KeyPathDotExpr *E) {
+      llvm_unreachable("found KeyPathDotExpr in CSApply");
     }
 
     /// Interface for ExprWalker
@@ -4032,6 +4372,12 @@ resolveLocatorToDecl(ConstraintSystem &cs, ConstraintLocator *locator,
       anchor = dotSyntax->getRHS();
       continue;
     }
+
+    if (auto *OEE = dyn_cast<OpenExistentialExpr>(anchor)) {
+      anchor = OEE->getSubExpr();
+      continue;
+    }
+
     break;
   } while (true);
   
@@ -4168,6 +4514,7 @@ findCalleeDeclRef(ConstraintSystem &cs, const Solution &solution,
     } else {
       newPath.push_back(ConstraintLocator::ApplyFunction);
     }
+
     assert(newPath.back().getNewSummaryFlags() == 0 &&
            "added element that changes the flags?");
     locator = cs.getConstraintLocator(locator->getAnchor(), newPath, newFlags);
@@ -4245,7 +4592,7 @@ getCallerDefaultArg(ConstraintSystem &cs, DeclContext *dc,
 
   case DefaultArgumentKind::Inherited:
     // Update the owner to reflect inheritance here.
-    owner = owner.getOverriddenDecl(tc.Context, &tc);
+    owner = owner.getOverriddenDecl(tc.Context);
     return getCallerDefaultArg(cs, dc, loc, owner, index);
 
   case DefaultArgumentKind::Column:
@@ -4359,7 +4706,7 @@ Expr *ExprRewriter::coerceTupleToTuple(Expr *expr, TupleType *fromTuple,
 
   // Capture the tuple expression, if there is one.
   Expr *innerExpr = lookThroughIdentityExprs(expr);
-  TupleExpr *fromTupleExpr = dyn_cast<TupleExpr>(innerExpr);
+  auto *fromTupleExpr = dyn_cast<TupleExpr>(innerExpr);
 
   /// Check each of the tuple elements in the destination.
   bool hasVariadic = false;
@@ -4431,7 +4778,7 @@ Expr *ExprRewriter::coerceTupleToTuple(Expr *expr, TupleType *fromTuple,
                                             fromTuple, toTuple);
       if (typeFromPattern) {
         std::vector<std::pair<SourceLoc, std::string>> locInsertPairs;
-        TuplePattern *tupleP = dyn_cast<TuplePattern>(typeFromPattern.getValue());
+        auto *tupleP = dyn_cast<TuplePattern>(typeFromPattern.getValue());
         if (tupleP && shouldApplyAddingLabelFixit(tupleP, toTuple, fromTuple,
                                                   locInsertPairs)) {
           for (auto &Pair : locInsertPairs) {
@@ -4802,6 +5149,41 @@ Expr *ExprRewriter::coerceExistential(Expr *expr, Type toType,
   return cs.cacheType(new (ctx) ErasureExpr(expr, toType, conformances));
 }
 
+/// Given that the given expression is an implicit conversion added
+/// to the target by coerceToType, find out how many OptionalEvaluationExprs
+/// it includes and the target.
+static unsigned getOptionalEvaluationDepth(Expr *expr, Expr *target) {
+  unsigned depth = 0;
+  while (true) {
+    // Look through sugar expressions.
+    expr = expr->getSemanticsProvidingExpr();
+
+    // If we find the target expression, we're done.
+    if (expr == target) return depth;
+
+    // If we see an optional evaluation, the depth goes up.
+    if (auto optEval = dyn_cast<OptionalEvaluationExpr>(expr)) {
+      depth++;
+      expr = optEval->getSubExpr();
+
+    // We have to handle any other expressions that can be introduced by
+    // coerceToType.
+    } else if (auto bind = dyn_cast<BindOptionalExpr>(expr)) {
+      expr = bind->getSubExpr();
+    } else if (auto force = dyn_cast<ForceValueExpr>(expr)) {
+      expr = force->getSubExpr();
+    } else if (auto open = dyn_cast<OpenExistentialExpr>(expr)) {
+      depth += getOptionalEvaluationDepth(open->getSubExpr(),
+                                          open->getOpaqueValue());
+      expr = open->getExistentialValue();
+
+    // Otherwise, look through implicit conversions.
+    } else {
+      expr = cast<ImplicitConversionExpr>(expr)->getSubExpr();
+    }
+  }
+}
+
 Expr *ExprRewriter::coerceOptionalToOptional(Expr *expr, Type toType,
                                              ConstraintLocatorBuilder locator,
                                           Optional<Pattern*> typeFromPattern) {
@@ -4839,13 +5221,18 @@ Expr *ExprRewriter::coerceOptionalToOptional(Expr *expr, Type toType,
   Type fromValueType = fromType->getAnyOptionalObjectType();
   Type toValueType = toType->getAnyOptionalObjectType();
 
-  expr =
-    cs.cacheType(new (tc.Context) BindOptionalExpr(expr,
-                                                   expr->getSourceRange().End,
-                                                   /*depth*/ 0, fromValueType));
+  // The depth we use here will get patched after we apply the coercion.
+  auto bindOptional =
+    new (tc.Context) BindOptionalExpr(expr, expr->getSourceRange().End,
+                                      /*depth*/ 0, fromValueType);
+
+  expr = cs.cacheType(bindOptional);
   expr->setImplicit(true);
   expr = coerceToType(expr, toValueType, locator, typeFromPattern);
   if (!expr) return nullptr;
+
+  unsigned depth = getOptionalEvaluationDepth(expr, bindOptional);
+  bindOptional->setDepth(depth);
       
   expr = cs.cacheType(new (tc.Context) InjectIntoOptionalExpr(expr, toType));
       
@@ -5012,8 +5399,8 @@ Expr *ExprRewriter::coerceCallArguments(
   (void)failed;
 
   // We should either have parentheses or a tuple.
-  TupleExpr *argTuple = dyn_cast<TupleExpr>(arg);
-  ParenExpr *argParen = dyn_cast<ParenExpr>(arg);
+  auto *argTuple = dyn_cast<TupleExpr>(arg);
+  auto *argParen = dyn_cast<ParenExpr>(arg);
   // FIXME: Eventually, we want to enforce that we have either argTuple or
   // argParen here.
 
@@ -5234,6 +5621,18 @@ Expr *ExprRewriter::coerceCallArguments(
   return shuffle;
 }
 
+static ClosureExpr *getClosureLiteralExpr(Expr *expr) {
+  expr = expr->getSemanticsProvidingExpr();
+
+  if (auto *captureList = dyn_cast<CaptureListExpr>(expr))
+    return captureList->getClosureBody();
+
+  if (auto *closure = dyn_cast<ClosureExpr>(expr))
+    return closure;
+
+  return nullptr;
+}
+
 /// If the expression is an explicit closure expression (potentially wrapped in
 /// IdentityExprs), change the type of the closure and identities to the
 /// specified type and return true.  Otherwise, return false with no effect.
@@ -5246,11 +5645,19 @@ static bool applyTypeToClosureExpr(ConstraintSystem &cs,
     return true;
   }
 
+  // Look through capture lists.
+  if (auto CLE = dyn_cast<CaptureListExpr>(expr)) {
+    if (!applyTypeToClosureExpr(cs, CLE->getClosureBody(), toType)) return false;
+    cs.setType(CLE, toType);
+    return true;
+  }
+
   // If we found an explicit ClosureExpr, update its type.
   if (auto CE = dyn_cast<ClosureExpr>(expr)) {
     cs.setType(CE, toType);
     return true;
   }
+
   // Otherwise fail.
   return false;
 }
@@ -5484,6 +5891,8 @@ Expr *ExprRewriter::buildCollectionUpcastExpr(Expr *expr, Type toType,
 
 Expr *ExprRewriter::buildObjCBridgeExpr(Expr *expr, Type toType,
                                         ConstraintLocatorBuilder locator) {
+  auto &tc = cs.getTypeChecker();
+
   Type fromType = cs.getType(expr);
 
   // Bridged collection casts always succeed, so we treat them as
@@ -5505,6 +5914,20 @@ Expr *ExprRewriter::buildObjCBridgeExpr(Expr *expr, Type toType,
     Expr *objcExpr = bridgeToObjectiveC(expr);
     if (!objcExpr)
       return nullptr;
+
+    // We might have a coercion of a Swift type to a CF type toll-free
+    // bridged to Objective-C.
+    //
+    // FIXME: Ideally we would instead have already recorded a restriction
+    // when solving the constraint, and we wouldn't need to duplicate this
+    // part of coerceToType() here.
+    if (auto foreignClass = toType->getClassOrBoundGenericClass()) {
+      if (foreignClass->getForeignClassKind() ==
+            ClassDecl::ForeignKind::CFType) {
+        return cs.cacheType(
+          new (tc.Context) ForeignObjectConversionExpr(objcExpr, toType));
+      }
+    }
 
     return coerceToType(objcExpr, toType, locator);
   }
@@ -6160,10 +6583,6 @@ Expr *ExprRewriter::convertLiteral(Expr *literal,
     if (!argType)
       return nullptr;
 
-    // If the argument type is in error, we're done.
-    if (argType->hasError())
-      return nullptr;
-
     // Convert the literal to the non-builtin argument type via the
     // builtin protocol, first.
     // FIXME: Do we need an opened type here?
@@ -6405,6 +6824,9 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
   
   auto fn = apply->getFn();
 
+  bool hasTrailingClosure =
+    isa<CallExpr>(apply) && cast<CallExpr>(apply)->hasTrailingClosure();
+
   auto finishApplyOfDeclWithSpecialTypeCheckingSemantics
     = [&](ApplyExpr *apply,
           ValueDecl *decl,
@@ -6413,9 +6835,26 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
       case DeclTypeCheckingSemantics::TypeOf: {
         // Resolve into a DynamicTypeExpr.
         auto arg = apply->getArg();
+
+        SmallVector<Identifier, 2> argLabelsScratch;
+
+        auto fnType = cs.getType(fn)->getAs<FunctionType>();
+        arg = coerceCallArguments(arg, fnType->getInput(),
+                                  apply,
+                                  apply->getArgumentLabels(argLabelsScratch),
+                                  hasTrailingClosure,
+                                  locator.withPathElement(
+                                    ConstraintLocator::ApplyArgument));
+        if (!arg) {
+          return nullptr;
+        }
+
+        if (auto shuffle = dyn_cast<TupleShuffleExpr>(arg))
+          arg = shuffle->getSubExpr();
+
         if (auto tuple = dyn_cast<TupleExpr>(arg))
           arg = tuple->getElements()[0];
-        arg = cs.coerceToRValue(arg);
+
         auto replacement = new (tc.Context)
           DynamicTypeExpr(apply->getFn()->getLoc(),
                           apply->getArg()->getStartLoc(),
@@ -6432,7 +6871,8 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
         assert(arg->getNumElements() == 2 && "should have two arguments");
         auto nonescaping = arg->getElements()[0];
         auto body = arg->getElements()[1];
-        auto bodyFnTy = cs.getType(body)->castTo<FunctionType>();
+        auto bodyTy = cs.getType(body)->getLValueOrInOutObjectType();
+        auto bodyFnTy = bodyTy->castTo<FunctionType>();
         auto escapableType = bodyFnTy->getInput();
         auto resultType = bodyFnTy->getResult();
         
@@ -6558,7 +6998,16 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
     // Use the subexpression as the function.
     fn = covariant->getSubExpr();
   }
-  
+
+  // An immediate application of a closure literal is always noescape.
+  if (getClosureLiteralExpr(fn)) {
+    if (auto fnTy = cs.getType(fn)->getAs<FunctionType>()) {
+      fnTy = cast<FunctionType>(
+        fnTy->withExtInfo(fnTy->getExtInfo().withNoEscape()));
+      fn = coerceToType(fn, fnTy, locator);
+    }
+  }
+
   apply->setFn(fn);
 
   // Check whether the argument is 'super'.
@@ -6569,8 +7018,6 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
   SmallVector<Identifier, 2> argLabelsScratch;
   if (auto fnType = cs.getType(fn)->getAs<FunctionType>()) {
     auto origArg = apply->getArg();
-    bool hasTrailingClosure =
-      isa<CallExpr>(apply) && cast<CallExpr>(apply)->hasTrailingClosure();
     Expr *arg = coerceCallArguments(origArg, fnType->getInput(),
                                     apply,
                                     apply->getArgumentLabels(argLabelsScratch),
@@ -6656,18 +7103,22 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
   auto metaTy = cs.getType(fn)->castTo<AnyMetatypeType>();
   auto ty = metaTy->getInstanceType();
 
-  // If this is an UnresolvedType in the system, preserve it.
-  if (ty->is<UnresolvedType>()) {
-    cs.setType(apply, ty);
-    return apply;
-  }
-
-  // If the metatype value isn't a type expression, the user should reference
-  // '.init' explicitly, for clarity.
   if (!cs.isTypeReference(fn)) {
-    cs.TC.diagnose(apply->getArg()->getStartLoc(),
-                   diag::missing_init_on_metatype_initialization)
-      .fixItInsert(apply->getArg()->getStartLoc(), ".init");
+    bool isExistentialType = false;
+    // If this is an attempt to initialize existential type.
+    if (auto metaType = cs.getType(fn)->getAs<MetatypeType>()) {
+      auto instanceType = metaType->getInstanceType();
+      isExistentialType = instanceType->isExistentialType();
+    }
+
+    if (!isExistentialType) {
+      // If the metatype value isn't a type expression,
+      // the user should reference '.init' explicitly, for clarity.
+      cs.TC
+          .diagnose(apply->getArg()->getStartLoc(),
+                    diag::missing_init_on_metatype_initialization)
+          .fixItInsert(apply->getArg()->getStartLoc(), ".init");
+    }
   }
 
   // If we're "constructing" a tuple type, it's simply a conversion.
@@ -6678,12 +7129,18 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
 
   // We're constructing a value of nominal type. Look for the constructor or
   // enum element to use.
-  assert(ty->getNominalOrBoundGenericNominal() || ty->is<DynamicSelfType>() ||
-         ty->isExistentialType() || ty->is<ArchetypeType>());
   auto ctorLocator = cs.getConstraintLocator(
                  locator.withPathElement(ConstraintLocator::ApplyFunction)
                         .withPathElement(ConstraintLocator::ConstructorMember));
   auto selected = getOverloadChoiceIfAvailable(ctorLocator);
+  if (!selected) {
+    assert(ty->hasError() || ty->hasUnresolvedType());
+    cs.setType(apply, ty);
+    return apply;
+  }
+
+  assert(ty->getNominalOrBoundGenericNominal() || ty->is<DynamicSelfType>() ||
+         ty->isExistentialType() || ty->is<ArchetypeType>());
 
   // We have the constructor.
   auto choice = selected->choice;
@@ -6852,17 +7309,6 @@ static bool exprNeedsParensAfterAddingAs(TypeChecker &TC, DeclContext *DC,
   return exprNeedsParensOutsideFollowingOperator(TC, DC, expr, rootExpr, asPG);
 }
 
-static bool exprNeedsParensInsidePostfixOperator(TypeChecker &TC,
-                                                 DeclContext *DC,
-                                                 Expr *expr) {
-  // Prefix and infix operators will bind outside of a postfix operator.
-  // Postfix operators will get token-merged with a new postfix operator.
-  return (isa<PrefixUnaryExpr>(expr) ||
-          isa<PostfixUnaryExpr>(expr) ||
-          isa<OptionalEvaluationExpr>(expr) ||
-          expr->isInfixOperator());
-}
-
 namespace {
   class ExprWalker : public ASTWalker {
     ExprRewriter &Rewriter;
@@ -6993,7 +7439,6 @@ Expr *ConstraintSystem::coerceToRValue(Expr *expr) {
   return expr;
 }
 
-
 /// Emit the fixes computed as part of the solution, returning true if we were
 /// able to emit an error message, or false if none of the fixits worked out.
 bool ConstraintSystem::applySolutionFixes(Expr *E, const Solution &solution) {
@@ -7003,9 +7448,6 @@ bool ConstraintSystem::applySolutionFixes(Expr *E, const Solution &solution) {
 
   return diagnosed;
 }
-
-
-
 
 /// \brief Apply the specified Fix # to this solution, producing a fixit hint
 /// diagnostic for it and returning true.  If the fixit hint turned out to be
@@ -7064,14 +7506,11 @@ bool ConstraintSystem::applySolutionFix(Expr *expr,
     } else {
       auto diag = TC.diagnose(affected->getLoc(),
                               diag::missing_unwrap_optional, type);
-      bool parensNeeded =
-        exprNeedsParensInsidePostfixOperator(TC, DC, affected);
-
-      if (parensNeeded) {
+      if (affected->canAppendPostfixExpression(true)) {
+        diag.fixItInsertAfter(affected->getEndLoc(), "!");
+      } else {
         diag.fixItInsert(affected->getStartLoc(), "(")
             .fixItInsertAfter(affected->getEndLoc(), ")!");
-      } else {
-        diag.fixItInsertAfter(affected->getEndLoc(), "!");
       }
     }
     return true;
@@ -7259,12 +7698,11 @@ Expr *ConstraintSystem::applySolutionShallow(const Solution &solution,
 Expr *Solution::coerceToType(Expr *expr, Type toType,
                              ConstraintLocator *locator,
                              bool ignoreTopLevelInjection,
-                             bool skipClosures,
                              Optional<Pattern*> typeFromPattern) const {
   auto &cs = getConstraintSystem();
   ExprRewriter rewriter(cs, *this,
                         /*suppressDiagnostics=*/false,
-                        /*skipClosures=*/skipClosures);
+                        /*skipClosures=*/false);
   Expr *result = rewriter.coerceToType(expr, toType, locator, typeFromPattern);
   if (!result)
     return nullptr;
@@ -7352,7 +7790,6 @@ Expr *TypeChecker::callWitness(Expr *base, DeclContext *dc,
   Type openedFullType, openedType;
   std::tie(openedFullType, openedType)
     = cs.getTypeOfMemberReference(base->getType(), witness, dc,
-                                  /*isTypeReference=*/false,
                                   /*isDynamicResult=*/false,
                                   FunctionRefKind::DoubleApply,
                                   dotLocator);
@@ -7469,7 +7906,7 @@ Solution::convertBooleanTypeToBuiltinI1(Expr *expr, ConstraintLocator *locator) 
     tc.diagnose(expr->getLoc(), diag::broken_bool);
     return nullptr;
   }
-  FuncDecl *builtinMethod = dyn_cast<FuncDecl>(members[0].Decl);
+  auto *builtinMethod = dyn_cast<FuncDecl>(members[0].Decl);
   if (!builtinMethod) {
     tc.diagnose(expr->getLoc(), diag::broken_bool);
     return nullptr;

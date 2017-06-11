@@ -19,9 +19,11 @@
 #include "swift/AST/CanTypeVisitor.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/Attr.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/Types.h"
+#include "swift/ClangImporter/ClangModule.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/Runtime/Metadata.h"
 #include "swift/SIL/FormalLinkage.h"
@@ -58,9 +60,6 @@
 
 using namespace swift;
 using namespace irgen;
-
-static llvm::Value *emitLoadOfObjCHeapMetadataRef(IRGenFunction &IGF,
-                                                  llvm::Value *object);
 
 static Address emitAddressOfMetadataSlotAtIndex(IRGenFunction &IGF,
                                                 llvm::Value *metadata,
@@ -442,7 +441,7 @@ bool irgen::isTypeMetadataAccessTrivial(IRGenModule &IGM, CanType type) {
     auto nominalType = cast<NominalType>(type);
 
     // Imported type metadata always requires an accessor.
-    if (nominalType->getDecl()->hasClangNode())
+    if (isa<ClangModuleUnit>(nominalType->getDecl()->getModuleScopeContext()))
       return false;
 
     // Metadata with a non-trivial parent node always requires an accessor.
@@ -778,7 +777,7 @@ namespace {
 
       auto resultMetadata = extractAndMarkResultType(type);
       
-      CanTupleType inputTuple = dyn_cast<TupleType>(type.getInput());
+      auto inputTuple = dyn_cast<TupleType>(type.getInput());
 
       size_t numArguments = 1;
 
@@ -950,7 +949,7 @@ namespace {
       // Note: ProtocolClassConstraint::Class is 0, ::Any is 1.
       auto classConstraint =
         llvm::ConstantInt::get(IGF.IGM.Int1Ty,
-                               !layout.requiresClass);
+                               !layout.requiresClass());
       llvm::Value *superclassConstraint =
         llvm::ConstantPointerNull::get(IGF.IGM.TypeMetadataPtrTy);
       if (layout.superclass) {
@@ -1274,9 +1273,10 @@ emitInPlaceTypeMetadataAccessFunctionBody(IRGenFunction &IGF,
                                                 cacheVariable,
                                                 std::move(initializer));
   onceFn = IGF.Builder.CreateBitCast(onceFn, IGF.IGM.Int8PtrTy);
+  auto context = llvm::UndefValue::get(IGF.IGM.Int8PtrTy);
 
   auto onceCall = IGF.Builder.CreateCall(IGF.IGM.getOnceFn(),
-                                         {onceGuard, onceFn});
+                                         {onceGuard, onceFn, context});
   onceCall->setCallingConv(IGF.IGM.DefaultCC);
 
   // We can just load the cache now.
@@ -1310,7 +1310,8 @@ static llvm::Value *emitTypeMetadataAccessFunctionBody(IRGenFunction &IGF,
     return emitDirectTypeMetadataRef(IGF, type);
 
   if (typeDecl->isGenericContext() &&
-      !(isa<ClassDecl>(typeDecl) && typeDecl->hasClangNode())) {
+      !(isa<ClassDecl>(typeDecl) &&
+        isa<ClangModuleUnit>(typeDecl->getModuleScopeContext()))) {
     // This is a metadata accessor for a fully substituted generic type.
     return emitDirectTypeMetadataRef(IGF, type);
   }
@@ -1341,7 +1342,7 @@ static llvm::Value *emitTypeMetadataAccessFunctionBody(IRGenFunction &IGF,
     }
 
   // Imported value types require foreign metadata uniquing.
-  } else if (typeDecl->hasClangNode()) {
+  } else if (isa<ClangModuleUnit>(typeDecl->getModuleScopeContext())) {
     return emitForeignTypeMetadataRef(IGF, type);
   }
 
@@ -2377,7 +2378,7 @@ namespace {
       llvm::raw_svector_ostream os(out);
       
       for (ValueDecl *prop : fields) {
-        os << prop->getName().str() << '\0';
+        os << prop->getBaseName() << '\0';
         ++numFields;
       }
       // The final null terminator is provided by getAddrOfGlobalString.
@@ -3349,6 +3350,14 @@ namespace {
         flags |= ClassFlags::UsesSwift1Refcounting;
       }
 
+      DeclAttributes attrs = Target->getAttrs();
+      if (auto objc = attrs.getAttribute<ObjCAttr>()) {
+        if (objc->getName())
+          flags |= ClassFlags::HasCustomObjCName;
+      }
+      if (attrs.hasAttribute<ObjCRuntimeNameAttr>())
+        flags |= ClassFlags::HasCustomObjCName;
+
       B.addInt32((uint32_t) flags);
     }
 
@@ -3497,6 +3506,10 @@ namespace {
         // It should be never called. We add a pointer to an error function.
         B.addBitCast(IGM.getDeletedMethodErrorFn(), IGM.FunctionPtrTy);
       }
+    }
+
+    void addPlaceholder(MissingMemberDecl *) {
+      llvm_unreachable("cannot generate metadata with placeholders in it");
     }
 
     void addMethodOverride(SILDeclRef baseRef, SILDeclRef declRef) {}
@@ -3699,7 +3712,7 @@ namespace {
 
       // Initialize the superclass if we didn't do so as a constant.
       if (HasUnfilledSuperclass) {
-        auto superclass = type->getSuperclass(nullptr)->getCanonicalType();
+        auto superclass = type->getSuperclass()->getCanonicalType();
         llvm::Value *superclassMetadata =
           emitClassHeapMetadataRef(IGF, superclass,
                                    MetadataValueType::TypeMetadata,
@@ -3981,6 +3994,8 @@ static void emitObjCClassSymbol(IRGenModule &IGM,
                                           metadata->getLinkage(),
                                           classSymbol.str(), metadata,
                                           IGM.getModule());
+  alias->setVisibility(metadata->getVisibility());
+
   if (IGM.useDllStorage())
     alias->setDLLStorageClass(metadata->getDLLStorageClass());
 }
@@ -4371,7 +4386,7 @@ irgen::emitClassResilientInstanceSizeAndAlignMask(IRGenFunction &IGF,
 }
 
 /// Given a non-tagged object pointer, load a pointer to its class object.
-static llvm::Value *emitLoadOfObjCHeapMetadataRef(IRGenFunction &IGF,
+llvm::Value *irgen::emitLoadOfObjCHeapMetadataRef(IRGenFunction &IGF,
                                                   llvm::Value *object) {
   if (IGF.IGM.TargetInfo.hasISAMasking()) {
     object = IGF.Builder.CreateBitCast(object,
@@ -4625,7 +4640,7 @@ llvm::Value *irgen::emitVirtualMethodValue(IRGenFunction &IGF,
     } else {
       // Otherwise, we can directly load the statically known superclass's
       // metadata.
-      auto superTy = instanceTy.getSuperclass(/*resolver=*/nullptr);
+      auto superTy = instanceTy.getSuperclass();
       metadata = emitClassHeapMetadataRef(IGF, superTy.getSwiftRValueType(),
                                           MetadataValueType::TypeMetadata);
     }
@@ -4650,6 +4665,14 @@ llvm::Value *irgen::emitVirtualMethodValue(IRGenFunction &IGF,
                  .getTargetIndex();
 
   return emitInvariantLoadFromMetadataAtIndex(IGF, metadata, index, fnTy);
+}
+
+unsigned irgen::getVirtualMethodIndex(IRGenModule &IGM,
+                                      SILDeclRef method) {
+  SILDeclRef overridden = IGM.getSILTypes().getOverriddenVTableEntry(method);
+  auto declaringClass = cast<ClassDecl>(overridden.getDecl()->getDeclContext());
+  return FindClassMethodIndex(IGM, declaringClass, overridden)
+   .getTargetIndex();;
 }
 
 //===----------------------------------------------------------------------===//
@@ -5435,7 +5458,7 @@ IRGenModule::getAddrOfForeignTypeMetadataCandidate(CanType type) {
     addressPoint = builder.getOffsetOfAddressPoint();
   } else if (auto structType = dyn_cast<StructType>(type)) {
     auto structDecl = structType->getDecl();
-    assert(structDecl->hasClangNode());
+    assert(isa<ClangModuleUnit>(structDecl->getModuleScopeContext()));
     
     ForeignStructMetadataBuilder builder(*this, structDecl, init);
     builder.layout();
@@ -5484,8 +5507,6 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   if (!known)
     return SpecialProtocol::None;
   switch (*known) {
-  case KnownProtocolKind::AnyObject:
-    return SpecialProtocol::AnyObject;
   case KnownProtocolKind::Error:
     return SpecialProtocol::Error;
     
@@ -5513,6 +5534,7 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::ExpressibleByImageLiteral:
   case KnownProtocolKind::ExpressibleByFileReferenceLiteral:
   case KnownProtocolKind::ExpressibleByBuiltinBooleanLiteral:
+  case KnownProtocolKind::ExpressibleByBuiltinUTF16ExtendedGraphemeClusterLiteral:
   case KnownProtocolKind::ExpressibleByBuiltinExtendedGraphemeClusterLiteral:
   case KnownProtocolKind::ExpressibleByBuiltinFloatLiteral:
   case KnownProtocolKind::ExpressibleByBuiltinIntegerLiteral:
@@ -5522,9 +5544,13 @@ SpecialProtocol irgen::getSpecialProtocolID(ProtocolDecl *P) {
   case KnownProtocolKind::OptionSet:
   case KnownProtocolKind::BridgedNSError:
   case KnownProtocolKind::BridgedStoredNSError:
+  case KnownProtocolKind::CFObject:
   case KnownProtocolKind::ErrorCodeProtocol:
   case KnownProtocolKind::ExpressibleByBuiltinConstStringLiteral:
   case KnownProtocolKind::ExpressibleByBuiltinConstUTF16StringLiteral:
+  case KnownProtocolKind::CodingKey:
+  case KnownProtocolKind::Encodable:
+  case KnownProtocolKind::Decodable:
     return SpecialProtocol::None;
   }
 

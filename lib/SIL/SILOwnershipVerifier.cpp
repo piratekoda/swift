@@ -395,12 +395,15 @@ NO_OPERAND_INST(IntegerLiteral)
 NO_OPERAND_INST(Metatype)
 NO_OPERAND_INST(ObjCProtocol)
 NO_OPERAND_INST(RetainValue)
+NO_OPERAND_INST(RetainValueAddr)
 NO_OPERAND_INST(StringLiteral)
 NO_OPERAND_INST(ConstStringLiteral)
 NO_OPERAND_INST(StrongRetain)
 NO_OPERAND_INST(StrongRetainUnowned)
 NO_OPERAND_INST(UnownedRetain)
 NO_OPERAND_INST(Unreachable)
+// TODO: Some key path components will have operands
+NO_OPERAND_INST(KeyPath)
 #undef NO_OPERAND_INST
 
 /// Instructions whose arguments are always compatible with one convention.
@@ -426,6 +429,7 @@ CONSTANT_OWNERSHIP_INST(Owned, true, DeallocPartialRef)
 CONSTANT_OWNERSHIP_INST(Owned, true, DeallocRef)
 CONSTANT_OWNERSHIP_INST(Owned, true, DestroyValue)
 CONSTANT_OWNERSHIP_INST(Owned, true, ReleaseValue)
+CONSTANT_OWNERSHIP_INST(Owned, true, ReleaseValueAddr)
 CONSTANT_OWNERSHIP_INST(Owned, true, StrongRelease)
 CONSTANT_OWNERSHIP_INST(Owned, true, StrongUnpin)
 CONSTANT_OWNERSHIP_INST(Owned, true, UnownedRelease)
@@ -434,6 +438,7 @@ CONSTANT_OWNERSHIP_INST(Owned, true, OpenExistentialOpaque)
 CONSTANT_OWNERSHIP_INST(Owned, true, EndLifetime)
 CONSTANT_OWNERSHIP_INST(Trivial, false, AddressToPointer)
 CONSTANT_OWNERSHIP_INST(Trivial, false, BeginAccess)
+CONSTANT_OWNERSHIP_INST(Trivial, false, BeginUnpairedAccess)
 CONSTANT_OWNERSHIP_INST(Trivial, false, BindMemory)
 CONSTANT_OWNERSHIP_INST(Trivial, false, CheckedCastAddrBranch)
 CONSTANT_OWNERSHIP_INST(Trivial, false, CondFail)
@@ -443,6 +448,7 @@ CONSTANT_OWNERSHIP_INST(Trivial, false, DebugValueAddr)
 CONSTANT_OWNERSHIP_INST(Trivial, false, DeinitExistentialAddr)
 CONSTANT_OWNERSHIP_INST(Trivial, false, DestroyAddr)
 CONSTANT_OWNERSHIP_INST(Trivial, false, EndAccess)
+CONSTANT_OWNERSHIP_INST(Trivial, false, EndUnpairedAccess)
 CONSTANT_OWNERSHIP_INST(Trivial, false, IndexAddr)
 CONSTANT_OWNERSHIP_INST(Trivial, false, IndexRawPointer)
 CONSTANT_OWNERSHIP_INST(Trivial, false, InitBlockStorageHeader)
@@ -806,6 +812,7 @@ OwnershipUseCheckerResult OwnershipCompatibilityUseChecker::visitCallee(
   ParameterConvention Conv = SubstCalleeType->getCalleeConvention();
   switch (Conv) {
   case ParameterConvention::Indirect_In:
+  case ParameterConvention::Indirect_In_Constant:
     assert(!SILModuleConventions(Mod).isSILIndirect(
         SILParameterInfo(SubstCalleeType, Conv)));
     return {compatibleWithOwnership(ValueOwnershipKind::Owned), true};
@@ -839,7 +846,7 @@ OwnershipUseCheckerResult OwnershipCompatibilityUseChecker::visitNonTrivialEnum(
   // Check if this enum has at least one case that is non-trivially typed.
   bool HasNonTrivialCase =
       llvm::any_of(E->getAllElements(), [this](EnumElementDecl *E) -> bool {
-        if (!E->getArgumentInterfaceType())
+        if (!E->hasAssociatedValues())
           return false;
         SILType EnumEltType = getType().getEnumElementType(E, Mod);
         return !EnumEltType.isTrivial(Mod);
@@ -885,6 +892,7 @@ OwnershipCompatibilityUseChecker::visitApplyInst(ApplyInst *I) {
 
   switch (I->getArgumentConvention(getOperandIndex() - 1)) {
   case SILArgumentConvention::Indirect_In:
+  case SILArgumentConvention::Indirect_In_Constant:
   case SILArgumentConvention::Indirect_In_Guaranteed:
   case SILArgumentConvention::Indirect_Inout:
   case SILArgumentConvention::Indirect_InoutAliasable:
@@ -914,6 +922,7 @@ OwnershipCompatibilityUseChecker::visitTryApplyInst(TryApplyInst *I) {
 
   switch (I->getArgumentConvention(getOperandIndex() - 1)) {
   case SILArgumentConvention::Indirect_In:
+  case SILArgumentConvention::Indirect_In_Constant:
   case SILArgumentConvention::Indirect_In_Guaranteed:
   case SILArgumentConvention::Indirect_Inout:
   case SILArgumentConvention::Indirect_InoutAliasable:
@@ -1101,10 +1110,12 @@ CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, IntToFPWithOverflow)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, IntToPtr)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, IsOptionalType)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, IsPOD)
+CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, IsSameMetatype)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, LShr)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, Mul)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, OnFastPath)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, Once)
+CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, OnceWithContext)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, Or)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, PtrToInt)
 CONSTANT_OWNERSHIP_BUILTIN(Trivial, false, SAddOver)

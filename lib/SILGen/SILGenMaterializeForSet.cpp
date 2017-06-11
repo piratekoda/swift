@@ -390,6 +390,8 @@ public:
   SILValue emitUsingStorage(SILGenFunction &gen, SILLocation loc,
                             ManagedValue self, RValue &&indices,
                             SILValue callbackBuffer, SILFunction *&callback);
+  SILFunction *createEndUnpairedAccessesCallback(SILFunction &F,
+                             const SILGenFunction::UnpairedAccesses &accesses);
 
   SILValue emitUsingAddressor(SILGenFunction &gen, SILLocation loc,
                               ManagedValue self, RValue &&indices,
@@ -429,13 +431,7 @@ public:
     // Metatypes and bases of non-mutating setters on value types
     //  are always rvalues.
     if (!SubstSelfType->getRValueInstanceType()->mayHaveSuperclass()) {
-      if (self.getType().isObject())
-        return LValue::forValue(self, SubstSelfType);
-      else {
-        if (!self.isLValue())
-          self = ManagedValue::forLValue(self.getValue());
-        return LValue::forAddress(self, None, selfPattern, SubstSelfType);
-      }
+      return LValue::forValue(self, SubstSelfType);
     }
 
     CanType witnessSelfType =
@@ -681,14 +677,19 @@ SILFunction *MaterializeForSetEmitter::createCallback(SILFunction &F,
   if (GenericEnv && GenericEnv->getGenericSignature()->areAllParamsConcrete())
     genericEnv = nullptr;
 
-  auto callback =
-    SGM.M.createFunction(Linkage, CallbackName, callbackType,
-                         genericEnv, SILLocation(Witness),
-                         IsBare, F.isTransparent(), F.isSerialized(),
-                         IsNotThunk, SubclassScope::NotApplicable,
-                         /*inlineStrategy=*/InlineDefault,
-                         /*EK=*/EffectsKind::Unspecified,
-                         /*InsertBefore=*/&F);
+  // The callback's symbol is irrelevant (it is just returned as a value from
+  // the actual materializeForSet function), and so we only need to make sure we
+  // don't break things in cases when there may be multiple definitions.
+  auto callbackLinkage =
+      hasSharedVisibility(Linkage) ? SILLinkage::Shared : SILLinkage::Private;
+
+  auto callback = SGM.M.createFunction(
+      callbackLinkage, CallbackName, callbackType, genericEnv,
+      SILLocation(Witness), IsBare, F.isTransparent(), F.isSerialized(),
+      IsNotThunk, SubclassScope::NotApplicable,
+      /*inlineStrategy=*/InlineDefault,
+      /*EK=*/EffectsKind::Unspecified,
+      /*InsertBefore=*/&F);
 
   callback->setDebugScope(new (SGM.M) SILDebugScope(Witness, callback));
 
@@ -737,18 +738,43 @@ SILValue MaterializeForSetEmitter::emitUsingStorage(SILGenFunction &gen,
   LValue lvalue = buildLValue(gen, loc, self, std::move(indices),
                               AccessKind::ReadWrite);
 
-  SmallVector<SILValue, 4> valuesToEndAccessOf;
-  gen.ValuesToEndAccessForMaterializeForSet = &valuesToEndAccessOf;
+  SILGenFunction::UnpairedAccesses unpairedAccesses(callbackBuffer);
+  gen.UnpairedAccessesForMaterializeForSet = &unpairedAccesses;
 
   ManagedValue address =
     gen.emitAddressOfLValue(loc, std::move(lvalue), AccessKind::ReadWrite);
 
-  if (!valuesToEndAccessOf.empty()) {
-    // FIXME: build callback to end access.
+  gen.UnpairedAccessesForMaterializeForSet = nullptr;
+
+  // Create a callback to end the unpaired accesses if any were pushed.
+  if (unpairedAccesses.NumAccesses) {
+    // If it ever proves necessary, we can make this work by allocating
+    // a (ValueBuffer x N) tuple in callbackBuffer and rewriting the existing
+    // uses.  But it probably won't ever prove necessary.
+    assert(unpairedAccesses.NumAccesses == 1 &&
+           "multiple unpaired accesses not supported");
+
+    callback = createEndUnpairedAccessesCallback(gen.F, unpairedAccesses);
   }
 
   return address.getUnmanagedValue();
 }
+
+SILFunction *
+MaterializeForSetEmitter::createEndUnpairedAccessesCallback(SILFunction &F,
+                     const SILGenFunction::UnpairedAccesses &unpairedAccesses) {
+  return createCallback(F, [&](SILGenFunction &gen, SILLocation loc,
+                               SILValue resultBuffer, SILValue callbackStorage,
+                               SILValue self) {
+    assert(unpairedAccesses.NumAccesses == 1 &&
+           "multiple unpaired accesses not supported");
+    gen.B.createEndUnpairedAccess(loc, callbackStorage,
+                                  SILAccessEnforcement::Dynamic,
+                                  /*aborting*/ false);
+  });
+}
+
+
 
 /// Emit a materializeForSet operation that calls a mutable addressor.
 ///

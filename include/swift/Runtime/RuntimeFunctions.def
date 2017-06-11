@@ -61,7 +61,7 @@ FUNCTION(MakeBoxUnique,
          DefaultCC,
          RETURNS(RefCountedPtrTy, OpaquePtrTy),
          ARGS(OpaquePtrTy, TypeMetadataPtrTy, SizeTy),
-         ATTRS(NoUnwind, ZExt))
+         ATTRS(NoUnwind))
 
 FUNCTION(DeallocBox, swift_deallocBox, DefaultCC,
          RETURNS(VoidTy),
@@ -1069,10 +1069,11 @@ FUNCTION(IsOptionalType,
          ATTRS(NoUnwind, ReadNone))
 
 // void swift_once(swift_once_t *predicate,
-//                 void (*function_code)(RefCounted*));
+//                 void (*function_code)(RefCounted*),
+//                 void *context);
 FUNCTION(Once, swift_once, DefaultCC,
          RETURNS(VoidTy),
-         ARGS(OnceTy->getPointerTo(), Int8PtrTy),
+         ARGS(OnceTy->getPointerTo(), Int8PtrTy, Int8PtrTy),
          ATTRS())
 
 // void swift_registerProtocolConformances(const ProtocolConformanceRecord *begin,
@@ -1086,6 +1087,18 @@ FUNCTION(RegisterTypeMetadataRecords,
          swift_registerTypeMetadataRecords, DefaultCC,
          RETURNS(VoidTy),
          ARGS(TypeMetadataRecordPtrTy, TypeMetadataRecordPtrTy),
+         ATTRS(NoUnwind))
+
+// void swift_beginAccess(void *pointer, ValueBuffer *scratch, size_t flags);
+FUNCTION(BeginAccess, swift_beginAccess, DefaultCC,
+         RETURNS(VoidTy),
+         ARGS(Int8PtrTy, getFixedBufferTy()->getPointerTo(), SizeTy, Int8PtrTy),
+         ATTRS(NoUnwind))
+
+// void swift_endAccess(ValueBuffer *scratch);
+FUNCTION(EndAccess, swift_endAccess, DefaultCC,
+         RETURNS(VoidTy),
+         ARGS(getFixedBufferTy()->getPointerTo()),
          ATTRS(NoUnwind))
 
 FUNCTION(InstantiateObjCClass, swift_instantiateObjCClass, DefaultCC,
@@ -1199,6 +1212,11 @@ FUNCTION(TSanInoutAccess, __tsan_write1, C_CC,
          ARGS(Int8PtrTy),
          ATTRS(NoUnwind))
 
+FUNCTION(GetKeyPath, swift_getKeyPath, C_CC,
+         RETURNS(RefCountedPtrTy),
+         ARGS(Int8PtrTy, Int8PtrTy),
+         ATTRS(NoUnwind))
+
 #if SWIFT_OBJC_INTEROP || !defined(SWIFT_RUNTIME_GENERATE_GLOBAL_SYMBOLS)
 
 // Put here all definitions of runtime functions which are:
@@ -1216,7 +1234,7 @@ FUNCTION(GetInitializedObjCClass, swift_getInitializedObjCClass, RegisterPreserv
 FUNCTION(Swift3ImplicitObjCEntrypoint, swift_objc_swift3ImplicitObjCEntrypoint,
          DefaultCC,
          RETURNS(VoidTy),
-         ARGS(ObjCPtrTy, ObjCSELTy),
+         ARGS(ObjCPtrTy, ObjCSELTy, Int8PtrTy, SizeTy, SizeTy, SizeTy, Int8PtrTy),
          ATTRS(NoUnwind))
 
 #endif

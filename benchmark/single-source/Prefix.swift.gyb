@@ -1,4 +1,4 @@
-//===--- Prefix.swift -----------------------------------------------------===//
+//===--- Prefix.swift -----------------------------------------*- swift -*-===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -50,8 +50,7 @@ public func run_Prefix${Name}(_ N: Int) {
     for element in s.prefix(prefixCount) {
       result += element
     }
-    CheckResults(result == sumCount,
-      "IncorrectResults in Prefix${Name}: \(result) != \(sumCount)")
+    CheckResults(result == sumCount)
   }
 }
 % end

@@ -1,4 +1,4 @@
-//===--- DropLast.swift ---------------------------------------------------===//
+//===--- DropLast.swift ---------------------------------------*- swift -*-===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -51,8 +51,7 @@ public func run_DropLast${Name}(_ N: Int) {
     for element in s.dropLast(dropCount) {
       result += element
     }
-    CheckResults(result == sumCount,
-      "IncorrectResults in DropLast${Name}: \(result) != \(sumCount)")
+    CheckResults(result == sumCount)
   }
 }
 % end

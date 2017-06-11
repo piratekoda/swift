@@ -36,6 +36,7 @@
 #include "swift/SIL/TypeLowering.h"
 #include "swift/SIL/SILPrintContext.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/SetVector.h"
@@ -48,6 +49,7 @@ namespace swift {
   class AnyFunctionType;
   class ASTContext;
   class FuncDecl;
+  class KeyPathPattern;
   class SILUndef;
   class SourceFile;
   class SerializedSILLoader;
@@ -99,18 +101,19 @@ public:
   using LinkingMode = SILOptions::LinkingMode;
 
 private:
-  friend class SILBasicBlock;
-  friend class SILCoverageMap;
-  friend class SILDefaultWitnessTable;
-  friend class SILFunction;
-  friend class SILGlobalVariable;
-  friend class SILLayout;
-  friend class SILType;
-  friend class SILVTable;
-  friend class SILUndef;
-  friend class SILWitnessTable;
-  friend class Lowering::SILGenModule;
-  friend class Lowering::TypeConverter;
+  friend KeyPathPattern;
+  friend SILBasicBlock;
+  friend SILCoverageMap;
+  friend SILDefaultWitnessTable;
+  friend SILFunction;
+  friend SILGlobalVariable;
+  friend SILLayout;
+  friend SILType;
+  friend SILVTable;
+  friend SILUndef;
+  friend SILWitnessTable;
+  friend Lowering::SILGenModule;
+  friend Lowering::TypeConverter;
   class SerializationCallback;
 
   /// Allocator that manages the memory of all the pieces of the SILModule.
@@ -188,6 +191,12 @@ private:
   /// The callback used by the SILLoader.
   std::unique_ptr<SerializationCallback> Callback;
 
+  // Callbacks registered by the SIL optimizer to run on each deserialized
+  // function body. This is intentionally a stateless type because the
+  // ModuleDecl and SILFunction should be sufficient context.
+  typedef void (*SILFunctionBodyCallback)(ModuleDecl *, SILFunction *F);
+  SmallVector<SILFunctionBodyCallback, 0> DeserializationCallbacks;
+
   /// The SILLoader used when linking functions into this module.
   ///
   /// This is lazily initialized the first time we attempt to
@@ -222,8 +231,17 @@ private:
   /// has not been created yet.
   SerializedSILLoader *getSILLoader();
 
+  /// Folding set for key path patterns.
+  llvm::FoldingSet<KeyPathPattern> KeyPathPatterns;
+
 public:
   ~SILModule();
+
+  /// Add a callback for each newly deserialized SIL function body.
+  void registerDeserializationCallback(SILFunctionBodyCallback callBack);
+
+  /// Return set of registered deserialization callbacks.
+  ArrayRef<SILFunctionBodyCallback> getDeserializationCallbacks();
 
   /// Add a delete notification handler \p Handler to the module context.
   void registerDeleteNotificationHandler(DeleteNotificationHandler* Handler);

@@ -77,7 +77,7 @@ public func withInvalidOrderings(_ body: (@escaping (Int, Int) -> Bool) -> Void)
 internal func _mapInPlace<C : MutableCollection>(
   _ elements: inout C,
   _ transform: (C.Iterator.Element) -> C.Iterator.Element
-) where C.Indices.Iterator.Element == C.Index {
+) {
   for i in elements.indices {
     elements[i] = transform(elements[i])
   }
@@ -122,17 +122,8 @@ extension TestSuite {
     collectionIsBidirectional: Bool = false
   ) where
     C.SubSequence : MutableCollection,
-    C.SubSequence.Iterator.Element == C.Iterator.Element,
-    C.SubSequence.Index == C.Index,
-    C.SubSequence.Indices.Iterator.Element == C.Index,
-    C.SubSequence.SubSequence == C.SubSequence,
     C.Indices : Collection,
-    C.Indices.Iterator.Element == C.Index,
-    C.Indices.Index == C.Index,
-    C.Indices.SubSequence == C.Indices,
     CollectionWithEquatableElement.Iterator.Element : Equatable,
-    CollectionWithEquatableElement.SubSequence.Iterator.Element
-      == CollectionWithEquatableElement.Iterator.Element,
     CollectionWithComparableElement.Iterator.Element : Comparable {
 
     var testNamePrefix = testNamePrefix
@@ -269,8 +260,7 @@ self.test("\(testNamePrefix).subscript(_: Range)/Set/semantics") {
 
       let newElements = makeWrappedCollection(
         test.expected.map { OpaqueValue($0.value + 90000) })
-      c[test.bounds(in: c)] =
-        newElements[newElements.startIndex..<newElements.endIndex]
+      c[test.bounds(in: c)] = newElements[...]
 
       // FIXME: improve checkForwardCollection to check the SubSequence type.
       /*
@@ -312,8 +302,7 @@ if isFixedLengthCollection {
     let newElements = makeWrappedCollection([ 91010, 92020, 93030, 94040 ].map(OpaqueValue.init))
 
     expectCrashLater()
-    c[c.startIndex..<c.endIndex] =
-      newElements[newElements.startIndex..<newElements.endIndex]
+    c[...] = newElements[...]
   }
 
   self.test("\(testNamePrefix).subscript(_: Range)/Set/SmallerRange") {
@@ -321,8 +310,7 @@ if isFixedLengthCollection {
     let newElements = makeWrappedCollection([ 91010, 92020 ].map(OpaqueValue.init))
 
     expectCrashLater()
-    c[c.startIndex..<c.endIndex] =
-      newElements[newElements.startIndex..<newElements.endIndex]
+    c[...] = newElements[...]
   }
 } else {
   self.test("\(testNamePrefix).subscript(_: Range)/Set/DifferentlySizedRange") {
@@ -331,8 +319,7 @@ if isFixedLengthCollection {
       let newElements = makeWrappedCollection(test.newElements)
       let rangeToReplace = test.rangeSelection.range(in: c)
 
-      c[rangeToReplace] =
-        newElements[newElements.startIndex..<newElements.endIndex]
+      c[rangeToReplace] = newElements[...]
 
       expectEqualSequence(
         test.expected,
@@ -376,8 +363,7 @@ if resiliencyChecks.subscriptRangeOnOutOfBoundsRangesBehavior != .none {
             let newValues = makeWrappedCollection(
               elements[i..<j].map { OpaqueValue($0.value + 90000) }
             )
-            slice[subSliceStartIndex..<subSliceEndIndex]
-              = newValues[newValues.startIndex..<newValues.endIndex]
+            slice[subSliceStartIndex..<subSliceEndIndex] = newValues[...]
             let subSlice = slice[subSliceStartIndex..<subSliceEndIndex]
             for (k, index) in subSlice.indices.enumerated() {
               expectEqual(
@@ -391,8 +377,7 @@ if resiliencyChecks.subscriptRangeOnOutOfBoundsRangesBehavior != .none {
                 extractValue(subSlice[index]).value)
             }
             let oldValues = makeWrappedCollection(Array(elements[i..<j]))
-            slice[subSliceStartIndex..<subSliceEndIndex]
-              = oldValues[oldValues.startIndex..<oldValues.endIndex]
+            slice[subSliceStartIndex..<subSliceEndIndex] = oldValues[...]
           }
         }
       }
@@ -446,7 +431,7 @@ if resiliencyChecks.subscriptRangeOnOutOfBoundsRangesBehavior != .none {
     let count: Int = numericCast(
       base.distance(from: bounds.lowerBound, to: bounds.upperBound))
     let newValues = makeWrappedCollection(Array(elements[0..<count]))
-    let newSlice = newValues[newValues.startIndex..<newValues.endIndex]
+    let newSlice = newValues[...]
 
     expectCrashLater()
     slice[bounds] = newSlice
@@ -498,7 +483,7 @@ func checkSortedPredicateThrow(
     result = try c.sorted {
       (lhs, rhs) throws -> Bool in
       _blackHole(closureLifetimeTracker)
-      if  throwElement == extractValue(rhs).value {
+      if throwElement == extractValue(rhs).value {
         thrown = true
         throw SillyError.JazzHands
       }
@@ -671,7 +656,7 @@ self.test("\(testNamePrefix).sorted/ThrowingPredicate") {
   }
 }
 
-self.test("\(testNamePrefix).sorted/ThrowingPredicateWithLargeNumberElememts") {
+self.test("\(testNamePrefix).sorted/ThrowingPredicateWithLargeNumberElements") {
   for sequence in largeElementSortTests {
       for i in 0..<sequence.count {
       checkSortedPredicateThrow(
@@ -793,17 +778,8 @@ self.test("\(testNamePrefix).partition/InvalidOrderings") {
     isFixedLengthCollection: Bool
   ) where
     C.SubSequence : BidirectionalCollection & MutableCollection,
-    C.SubSequence.Iterator.Element == C.Iterator.Element,
-    C.SubSequence.Index == C.Index,
-    C.SubSequence.Indices.Iterator.Element == C.Index,
-    C.SubSequence.SubSequence == C.SubSequence,
     C.Indices : BidirectionalCollection,
-    C.Indices.Iterator.Element == C.Index,
-    C.Indices.Index == C.Index,
-    C.Indices.SubSequence == C.Indices,
     CollectionWithEquatableElement.Iterator.Element : Equatable,
-    CollectionWithEquatableElement.SubSequence.Iterator.Element
-      == CollectionWithEquatableElement.Iterator.Element,
     CollectionWithComparableElement.Iterator.Element : Comparable {
 
     var testNamePrefix = testNamePrefix
@@ -948,19 +924,9 @@ self.test("\(testNamePrefix).partition/DispatchesThrough_withUnsafeMutableBuffer
     isFixedLengthCollection: Bool
   ) where
     C.SubSequence : RandomAccessCollection & MutableCollection,
-    C.SubSequence.Iterator.Element == C.Iterator.Element,
-    C.SubSequence.Index == C.Index,
-    C.SubSequence.Indices.Iterator.Element == C.Index,
-    C.SubSequence.SubSequence == C.SubSequence,
     C.Indices : RandomAccessCollection,
-    C.Indices.Iterator.Element == C.Index,
-    C.Indices.Index == C.Index,
-    C.Indices.SubSequence == C.Indices,
     CollectionWithEquatableElement.Iterator.Element : Equatable,
-    CollectionWithEquatableElement.SubSequence.Iterator.Element
-      == CollectionWithEquatableElement.Iterator.Element,
-    CollectionWithComparableElement.Iterator.Element : Comparable,
-    CollectionWithComparableElement.SubSequence.Indices.Iterator.Element == CollectionWithComparableElement.Index {
+    CollectionWithComparableElement.Iterator.Element : Comparable {
 
     var testNamePrefix = testNamePrefix
 
@@ -1033,7 +999,7 @@ func checkSortPredicateThrow(
     try c.sort {
       (lhs, rhs) throws -> Bool in
       _blackHole(closureLifetimeTracker)
-      if  throwElement == extractValue(rhs).value {
+      if throwElement == extractValue(rhs).value {
         throw SillyError.JazzHands
       }
       return lessImpl(extractValue(lhs).value, extractValue(rhs).value)

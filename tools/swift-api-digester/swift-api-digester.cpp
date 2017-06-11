@@ -173,21 +173,6 @@ typedef SDKNode* NodePtr;
 typedef std::map<NodePtr, NodePtr> ParentMap;
 typedef std::vector<NodePtr> NodeVector;
 
-class SDKContext {
-  llvm::StringSet<> TextData;
-  std::vector<std::unique_ptr<SDKNode>> OwnedNodes;
-
-public:
-  SDKNode* own(SDKNode *Node) {
-    assert(Node);
-    OwnedNodes.emplace_back(Node);
-    return Node;
-  }
-  StringRef buffer(StringRef Text) {
-    return TextData.insert(Text).first->getKey();
-  }
-};
-
 // The interface used to visit the SDK tree.
 class SDKNodeVisitor {
   friend SDKNode;
@@ -216,6 +201,39 @@ struct MatchedNodeListener {
   virtual void foundMatch(NodePtr Left, NodePtr Right) = 0;
   virtual void foundRemoveAddMatch(NodePtr Removed, NodePtr Added) {}
   virtual ~MatchedNodeListener() = default;
+};
+
+using NodePairVector = llvm::MapVector<NodePtr, NodePtr>;
+
+// This map keeps track of updated nodes; thus we can conveniently find out what
+// is the counterpart of a node before or after being updated.
+class UpdatedNodesMap : public MatchedNodeListener {
+  NodePairVector MapImpl;
+  UpdatedNodesMap(const UpdatedNodesMap& that) = delete;
+public:
+  UpdatedNodesMap() = default;
+  NodePtr findUpdateCounterpart(const SDKNode *Node) const;
+  void foundMatch(NodePtr Left, NodePtr Right) override {
+    assert(Left && Right && "Not update operation.");
+    MapImpl.insert({Left, Right});
+  }
+};
+
+class SDKContext {
+  llvm::StringSet<> TextData;
+  llvm::BumpPtrAllocator Allocator;
+  UpdatedNodesMap UpdateMap;
+
+public:
+  llvm::BumpPtrAllocator &allocator() {
+    return Allocator;
+  }
+  StringRef buffer(StringRef Text) {
+    return TextData.insert(Text).first->getKey();
+  }
+  UpdatedNodesMap &getNodeUpdateMap() {
+    return UpdateMap;
+  }
 };
 
 // A node matcher will traverse two trees of SDKNode and find matched nodes
@@ -369,6 +387,16 @@ public:
   bool isDeprecated() const;
   bool isStatic() const { return IsStatic; };
 };
+
+NodePtr UpdatedNodesMap::findUpdateCounterpart(const SDKNode *Node) const {
+  assert(Node->isAnnotatedAs(NodeAnnotation::Updated) && "Not update operation.");
+  auto FoundPair = std::find_if(MapImpl.begin(), MapImpl.end(),
+                      [&](std::pair<NodePtr, NodePtr> Pair) {
+    return Pair.second == Node || Pair.first == Node;
+  });
+  assert(FoundPair != MapImpl.end() && "Cannot find update counterpart.");
+  return Node == FoundPair->first ? FoundPair->second : FoundPair->first;
+}
 
 class SDKNodeType : public SDKNode {
   std::vector<TypeAttrKind> TypeAttributes;
@@ -954,7 +982,7 @@ static StringRef getTypeName(SDKContext &Ctx, Type Ty) {
   if (Ty->isVoid()) {
     return Ctx.buffer("Void");
   }
-  if (NameAliasType *NAT = dyn_cast<NameAliasType>(Ty.getPointer())) {
+  if (auto *NAT = dyn_cast<NameAliasType>(Ty.getPointer())) {
     return NAT->getDecl()->getNameStr();
   }
   if (Ty->getAnyNominal()) {
@@ -1004,7 +1032,8 @@ static StringRef getPrintedName(SDKContext &Ctx, ValueDecl *VD) {
   if (auto FD = dyn_cast<AbstractFunctionDecl>(VD)) {
     auto DM = FD->getFullName();
 
-    Result.append(DM.getBaseName().empty() ? "_" : DM.getBaseName().str());
+    // TODO: Handle special names
+    Result.append(DM.getBaseName().empty() ? "_" :DM.getBaseIdentifier().str());
     Result.append("(");
     for (auto Arg : DM.getArgumentNames()) {
       Result.append(Arg.empty() ? "_" : Arg.str());
@@ -1014,7 +1043,8 @@ static StringRef getPrintedName(SDKContext &Ctx, ValueDecl *VD) {
     return Ctx.buffer(Result.str());
   }
   auto DM = VD->getFullName();
-  Result.append(DM.getBaseName().str());
+  // TODO: Handle special names
+  Result.append(DM.getBaseIdentifier().str());
   return Ctx.buffer(Result.str());
 }
 
@@ -1053,8 +1083,9 @@ SDKNodeInitInfo::SDKNodeInitInfo(SDKContext &Ctx, Type Ty) :
     TypeAttrs.push_back(TypeAttrKind::TAK_noescape);
 }
 
+// TODO: Handle special names
 SDKNodeInitInfo::SDKNodeInitInfo(SDKContext &Ctx, ValueDecl *VD) : Ctx(Ctx),
-    Name(VD->hasName() ? VD->getName().str() : Ctx.buffer("_")),
+    Name(VD->hasName() ? VD->getBaseName().getIdentifier().str() : Ctx.buffer("_")),
     PrintedName(getPrintedName(Ctx, VD)), DKind(VD->getKind()),
     USR(calculateUsr(Ctx, VD)), Location(calculateLocation(Ctx, VD)),
     ModuleName(VD->getModuleContext()->getName().str()),
@@ -1066,15 +1097,14 @@ SDKNodeInitInfo::SDKNodeInitInfo(SDKContext &Ctx, ValueDecl *VD) : Ctx(Ctx),
 }
 
 SDKNode *SDKNodeInitInfo::createSDKNode(SDKNodeKind Kind) {
-  SDKNode *Result;
   switch(Kind) {
 #define NODE_KIND(X)                                                           \
 case SDKNodeKind::X:                                                           \
-  Result = static_cast<SDKNode*>(new SDKNode##X(*this));                       \
+  return static_cast<SDKNode*>(new (Ctx.allocator().Allocate<SDKNode##X>())    \
+    SDKNode##X(*this));                                                        \
   break;
 #include "swift/IDE/DigesterEnums.def"
   }
-  return Ctx.own(Result);
 }
 
 // Recursively construct a node that represents a type, for instance,
@@ -1163,7 +1193,7 @@ static bool shouldIgnore(Decl *D) {
   if (auto VD = dyn_cast<ValueDecl>(D)) {
     if (VD->isOperator())
       return true;
-    if (VD->getName().empty())
+    if (VD->getBaseName().empty())
       return true;
     switch (VD->getFormalAccess()) {
     case Accessibility::Internal:
@@ -1934,30 +1964,6 @@ public:
   virtual ~SDKTreeDiffPass() {}
 };
 
-using NodePairVector = std::vector<std::pair<NodePtr, NodePtr>>;
-
-// This map keeps track of updated nodes; thus we can conveniently find out what
-// is the counterpart of a node before or after being updated.
-class UpdatedNodesMap : public MatchedNodeListener {
-  NodePairVector MapImpl;
-
-public:
-  void foundMatch(NodePtr Left, NodePtr Right) override {
-    assert(Left && Right && "Not update operation.");
-    MapImpl.push_back(std::make_pair(Left, Right));
-  }
-
-  NodePtr findUpdateCounterpart(const SDKNode *Node) const {
-    assert(Node->isAnnotatedAs(NodeAnnotation::Updated) && "Not update operation.");
-    auto FoundPair = std::find_if(MapImpl.begin(), MapImpl.end(),
-                        [&](std::pair<NodePtr, NodePtr> Pair) {
-      return Pair.second == Node || Pair.first == Node;
-    });
-    assert(FoundPair != MapImpl.end() && "Cannot find update counterpart.");
-    return Node == FoundPair->first ? FoundPair->second : FoundPair->first;
-  }
-};
-
 static void detectFuncDeclChange(NodePtr L, NodePtr R) {
   assert(L->getKind() == R->getKind());
   if (auto LF = dyn_cast<SDKNodeAbstractFunc>(L)) {
@@ -2015,10 +2021,10 @@ class PrunePass : public MatchedNodeListener, public SDKTreeDiffPass {
       Right->removeChild(R);
   }
 
-  std::unique_ptr<UpdatedNodesMap> UpdateMap;
+  UpdatedNodesMap &UpdateMap;
 
 public:
-  PrunePass() : UpdateMap(new UpdatedNodesMap()) {}
+  PrunePass(UpdatedNodesMap &UpdateMap) : UpdateMap(UpdateMap) {}
 
   void foundRemoveAddMatch(NodePtr Left, NodePtr Right) override {
     if (!Left)
@@ -2038,7 +2044,7 @@ public:
     Left->annotate(NodeAnnotation::Updated);
     Right->annotate(NodeAnnotation::Updated);
     // Push the updated node to the map for future reference.
-    UpdateMap->foundMatch(Left, Right);
+    UpdateMap.foundMatch(Left, Right);
 
     if (Left->getKind() != Right->getKind()) {
       assert(isa<SDKNodeType>(Left) && isa<SDKNodeType>(Right) &&
@@ -2092,10 +2098,6 @@ public:
 
   void pass(NodePtr Left, NodePtr Right) override {
     foundMatch(Left, Right);
-  }
-
-  std::unique_ptr<UpdatedNodesMap> getNodeUpdateMap() {
-    return std::move(UpdateMap);
   }
 };
 
@@ -2156,9 +2158,18 @@ class TypeMemberDiffFinder : public SDKNodeVisitor {
     auto diffParent = diffNode->getParent();
     assert(nodeParent && diffParent && "trying to check Root?");
 
+    // Move from global variable to a member variable.
     if (nodeParent->getKind() == SDKNodeKind::TypeDecl &&
         diffParent->getKind() == SDKNodeKind::Root)
-      TypeMemberDiffs.push_back({diffNode, node});
+      TypeMemberDiffs.insert({diffNode, node});
+    // Move from a member variable to another member variable
+    if (nodeParent->getKind() == SDKNodeKind::TypeDecl &&
+        diffParent->getKind() == SDKNodeKind::TypeDecl &&
+        declNode->isStatic() &&
+        nodeParent->getAs<SDKNodeDecl>()->getFullyQualifiedName() !=
+          diffParent->getAs<SDKNodeDecl>()->getFullyQualifiedName())
+      TypeMemberDiffs.insert({diffNode, node});
+    // Move from a getter/setter function to a property
     else if (node->getKind() == SDKNodeKind::Getter &&
              diffNode->getKind() == SDKNodeKind::Function &&
              node->isNameValid()) {
@@ -2213,7 +2224,7 @@ public:
 
 class ChangeRefinementPass : public SDKTreeDiffPass, public SDKNodeVisitor {
   bool IsVisitingLeft;
-  std::unique_ptr<UpdatedNodesMap> UpdateMap;
+  UpdatedNodesMap &UpdateMap;
 
 #define ANNOTATE(Node, Counter, X, Y)                                          \
   auto ToAnnotate = IsVisitingLeft ? Node : Counter;                           \
@@ -2285,14 +2296,13 @@ class ChangeRefinementPass : public SDKTreeDiffPass, public SDKNodeVisitor {
   }
 
   bool isUnhandledCase(SDKNodeType *Node) {
-    auto Counter = UpdateMap->findUpdateCounterpart(Node)->getAs<SDKNodeType>();
+    auto Counter = UpdateMap.findUpdateCounterpart(Node)->getAs<SDKNodeType>();
     return Node->getTypeKind() == KnownTypeKind::Void ||
            Counter->getTypeKind() == KnownTypeKind::Void;
   }
 
 public:
-  ChangeRefinementPass(std::unique_ptr<UpdatedNodesMap> UpdateMap) :
-    UpdateMap(std::move(UpdateMap)) {}
+  ChangeRefinementPass(UpdatedNodesMap &UpdateMap) : UpdateMap(UpdateMap) {}
 
   void pass(NodePtr Left, NodePtr Right) override {
 
@@ -2308,7 +2318,7 @@ public:
     if (!Node || !Node->isAnnotatedAs(NodeAnnotation::Updated) ||
         isUnhandledCase(Node))
       return;
-    auto Counter = const_cast<SDKNodeType*>(UpdateMap->
+    auto Counter = const_cast<SDKNodeType*>(UpdateMap.
       findUpdateCounterpart(Node)->getAs<SDKNodeType>());
 
     bool Result = detectWrapOptional(Node, Counter)||
@@ -2318,10 +2328,6 @@ public:
                   detectTypeRewritten(Node, Counter);
     (void) Result;
     return;
-  }
-
-  std::unique_ptr<UpdatedNodesMap> getNodeUpdateMap() {
-    return std::move(UpdateMap);
   }
 };
 
@@ -2471,7 +2477,7 @@ class DiffItemEmitter : public SDKNodeVisitor {
   }
 
   void visit(NodePtr Node) override {
-    SDKNodeDecl *Parent = dyn_cast<SDKNodeDecl>(Node);
+    auto *Parent = dyn_cast<SDKNodeDecl>(Node);
     if (!Parent) {
       if (auto TN = dyn_cast<SDKNodeType>(Node)) {
         Parent = TN->getClosestParentDecl();
@@ -2634,7 +2640,7 @@ class DiagnosisEmitter : public SDKNodeVisitor {
   DiagBag<MovedDeclDiag> MovedDecls;
   DiagBag<RemovedDeclDiag> RemovedDecls;
 
-  UpdatedNodesMap UpdateMap;
+  UpdatedNodesMap &UpdateMap;
   DiagnosisEmitter(UpdatedNodesMap &UpdateMap) : UpdateMap(UpdateMap) {}
 public:
   static void diagnosis(NodePtr LeftRoot, NodePtr RightRoot,
@@ -2756,15 +2762,17 @@ void DiagnosisEmitter::handle(const SDKNodeDecl *Node, NodeAnnotation Anno) {
   switch(Anno) {
   case NodeAnnotation::Removed: {
     if (auto *Added = findAddedDecl(Node)) {
-      MovedDecls.Diags.emplace_back(Node->getDeclKind(),
-                                    Added->getDeclKind(),
-                                    Node->getFullyQualifiedName(),
-                                    Added->getFullyQualifiedName());
-    } else {
-      RemovedDecls.Diags.emplace_back(Node->getDeclKind(),
+      if (Node->getDeclKind() != DeclKind::Constructor) {
+        MovedDecls.Diags.emplace_back(Node->getDeclKind(),
+                                      Added->getDeclKind(),
                                       Node->getFullyQualifiedName(),
-                                      Node->isDeprecated());
+                                      Added->getFullyQualifiedName());
+        return;
+      }
     }
+    RemovedDecls.Diags.emplace_back(Node->getDeclKind(),
+                                    Node->getFullyQualifiedName(),
+                                    Node->isDeprecated());
     return;
   }
   case NodeAnnotation::Rename: {
@@ -2838,11 +2846,12 @@ void DiagnosisEmitter::visitType(SDKNodeType *Node) {
       Descriptor = isa<SDKNodeAbstractFunc>(Parent) ?
         SDKNodeAbstractFunc::getTypeRoleDescription(Ctx, Parent->getChildIndex(Node)) :
         Ctx.buffer("declared");
-      TypeChangedDecls.Diags.emplace_back(Parent->getDeclKind(),
-                                          Parent->getFullyQualifiedName(),
-                                          Node->getPrintedName(),
-                                          Count->getPrintedName(),
-                                          Descriptor);
+      if (Node->getPrintedName() != Count->getPrintedName())
+        TypeChangedDecls.Diags.emplace_back(Parent->getDeclKind(),
+                                            Parent->getFullyQualifiedName(),
+                                            Node->getPrintedName(),
+                                            Count->getPrintedName(),
+                                            Descriptor);
       break;
     default:
       break;
@@ -2931,26 +2940,6 @@ public:
 namespace fs = llvm::sys::fs;
 namespace path = llvm::sys::path;
 
-static StringRef constructFullTypeName(NodePtr Node) {
-  assert(Node->getKind() == SDKNodeKind::TypeDecl);
-  std::vector<NodePtr> TypeChain;
-  for (auto C = Node; C->getKind() == SDKNodeKind::TypeDecl; C = C->getParent()) {
-    TypeChain.insert(TypeChain.begin(), C);
-  }
-  assert(TypeChain.front()->getParent()->getKind() == SDKNodeKind::Root);
-  llvm::SmallString<64> Buffer;
-  bool First = true;
-  for (auto N : TypeChain) {
-    if (First) {
-      First = false;
-    } else {
-      Buffer.append(".");
-    }
-    Buffer.append(N->getName());
-  }
-  return Node->getSDKContext().buffer(Buffer.str());
-}
-
 struct RenameDetectorForMemberDiff : public MatchedNodeListener {
   void foundMatch(NodePtr Left, NodePtr Right) override {
     detectRename(Left, Right);
@@ -2992,14 +2981,20 @@ static void findTypeMemberDiffs(NodePtr leftSDKRoot, NodePtr rightSDKRoot,
   RenameDetectorForMemberDiff Detector;
   for (auto pair : diffFinder.getDiffs()) {
     auto left = pair.first;
+    auto leftParent = left->getParent();
     auto right = pair.second;
     auto rightParent = right->getParent();
 
     // SDK_CHANGE_TYPE_MEMBER(USR, new type context name, new printed name, self
     // index, old printed name)
     TypeMemberDiffItem item = {
-        right->getAs<SDKNodeDecl>()->getUsr(), constructFullTypeName(rightParent),
-        right->getPrintedName(), findSelfIndex(right), left->getPrintedName()};
+        right->getAs<SDKNodeDecl>()->getUsr(),
+        rightParent->getAs<SDKNodeDecl>()->getFullyQualifiedName(),
+        right->getPrintedName(), findSelfIndex(right), None,
+        leftParent->getKind() == SDKNodeKind::Root ?
+          StringRef() : leftParent->getAs<SDKNodeDecl>()->getFullyQualifiedName(),
+        left->getPrintedName()
+    };
     out.emplace_back(item);
     Detector.workOn(left, right);
   }
@@ -3021,12 +3016,11 @@ static int diagnoseModuleChange(StringRef LeftPath, StringRef RightPath) {
   RightCollector.deSerialize(RightPath);
   auto LeftModule = LeftCollector.getSDKRoot();
   auto RightModule = RightCollector.getSDKRoot();
-  PrunePass Prune;
+  PrunePass Prune(Ctx.getNodeUpdateMap());
   Prune.pass(LeftModule, RightModule);
-  ChangeRefinementPass RefinementPass(Prune.getNodeUpdateMap());
+  ChangeRefinementPass RefinementPass(Ctx.getNodeUpdateMap());
   RefinementPass.pass(LeftModule, RightModule);
-  DiagnosisEmitter::diagnosis(LeftModule, RightModule,
-                              *RefinementPass.getNodeUpdateMap());
+  DiagnosisEmitter::diagnosis(LeftModule, RightModule, Ctx.getNodeUpdateMap());
   return 0;
 }
 
@@ -3057,10 +3051,10 @@ static int compareSDKs(StringRef LeftPath, StringRef RightPath,
   TypeMemberDiffVector typeMemberDiffs;
   findTypeMemberDiffs(LeftModule, RightModule, typeMemberDiffs);
 
-  PrunePass Prune;
+  PrunePass Prune(Ctx.getNodeUpdateMap());
   Prune.pass(LeftModule, RightModule);
   llvm::errs() << "Finished pruning" << "\n";
-  ChangeRefinementPass RefinementPass(Prune.getNodeUpdateMap());
+  ChangeRefinementPass RefinementPass(Ctx.getNodeUpdateMap());
   RefinementPass.pass(LeftModule, RightModule);
   DiffVector AllItems;
   DiffItemEmitter::collectDiffItems(LeftModule, AllItems);

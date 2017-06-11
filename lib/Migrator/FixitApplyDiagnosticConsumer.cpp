@@ -1,4 +1,4 @@
-//===--- FixitApplyDiagnosticConsumer.cpp -----------------------*- C++ -*-===//
+//===--- FixitApplyDiagnosticConsumer.cpp ---------------------------------===//
 //
 // This source file is part of the Swift.org open source project
 //
@@ -21,29 +21,14 @@ using namespace swift;
 using namespace swift::migrator;
 
 FixitApplyDiagnosticConsumer::
-FixitApplyDiagnosticConsumer(const MigratorOptions &MigratorOpts,
-                             const StringRef Text,
+FixitApplyDiagnosticConsumer(const StringRef Text,
                              const StringRef BufferName)
-  : MigratorOpts(MigratorOpts),
-    Text(Text), BufferName(BufferName), NumFixitsApplied(0) {
+  : Text(Text), BufferName(BufferName), NumFixitsApplied(0) {
   RewriteBuf.Initialize(Text);
 }
 
 void FixitApplyDiagnosticConsumer::printResult(llvm::raw_ostream &OS) const {
   RewriteBuf.write(OS);
-}
-
-bool FixitApplyDiagnosticConsumer::
-shouldTakeFixit(const DiagnosticInfo &Info,
-                const DiagnosticInfo::FixIt &F) const {
-
-  if (MigratorOpts.AddObjC) {
-    if (Info.ID == diag::objc_inference_swift3_addobjc.ID) {
-      return true;
-    }
-  }
-
-  return false;
 }
 
 void FixitApplyDiagnosticConsumer::
@@ -52,26 +37,34 @@ handleDiagnostic(SourceManager &SM, SourceLoc Loc,
                  StringRef FormatString,
                  ArrayRef<DiagnosticArgument> FormatArgs,
                  const DiagnosticInfo &Info) {
+  if (Loc.isInvalid()) {
+    return;
+  }
   auto ThisBufferID = SM.findBufferContainingLoc(Loc);
   auto ThisBufferName = SM.getIdentifierForBuffer(ThisBufferID);
   if (ThisBufferName != BufferName) {
     return;
   }
 
+  if (!shouldTakeFixit(Kind, Info)) {
+    return;
+  }
+
   for (const auto &Fixit : Info.FixIts) {
-    if (!shouldTakeFixit(Info, Fixit)) {
-      continue;
-    }
 
     auto Offset = SM.getLocOffsetInBuffer(Fixit.getRange().getStart(),
                                           ThisBufferID);
     auto Length = Fixit.getRange().getByteLength();
 
+    if (Fixit.getText().ltrim().rtrim() == "@objc") {
+      if (AddedObjC.count(Loc.getOpaquePointerValue())) {
+        return;
+      } else {
+        AddedObjC.insert(Loc.getOpaquePointerValue());
+      }
+    }
+
     RewriteBuf.ReplaceText(Offset, Length, Fixit.getText());
     ++NumFixitsApplied;
-
-    Replacements.push_back({
-      BufferName, Offset, Length, Fixit.getText().str(), Info.ID
-    });
   }
 }

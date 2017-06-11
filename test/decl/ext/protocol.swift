@@ -923,12 +923,12 @@ extension BadProto1 {
 
 protocol BadProto3 { }
 typealias BadProto4 = BadProto3
-extension BadProto4 { } // expected-error{{protocol 'BadProto3' in the module being compiled cannot be extended via a typealias}}{{11-20=BadProto3}}
+extension BadProto4 { } // expected-error{{protocol 'BadProto3' in the module being compiled cannot be extended via a type alias}}{{11-20=BadProto3}}
 
 typealias RawRepresentableAlias = RawRepresentable
 extension RawRepresentableAlias { } // okay
 
-extension AnyObject { } // expected-error{{'AnyObject' protocol cannot be extended}}
+extension AnyObject { } // expected-error{{non-nominal type 'AnyObject' cannot be extended}}
 
 // Members of protocol extensions cannot be overridden.
 // rdar://problem/21075287
@@ -948,6 +948,6 @@ class BadClass5 : BadProto5 {} // expected-error{{type 'BadClass5' does not conf
 typealias A = BadProto1
 typealias B = BadProto1
 
-extension A & B { // expected-error{{protocol 'BadProto1' in the module being compiled cannot be extended via a typealias}}
+extension A & B { // expected-error{{protocol 'BadProto1' in the module being compiled cannot be extended via a type alias}}
 
 }

@@ -130,30 +130,20 @@ public:
   /// Assume that code will be executed in a single-threaded environment.
   bool AssumeSingleThreaded = false;
 
-  /// Use the copy-on-write implementation for opaque existentials.
-#ifdef SWIFT_RUNTIME_ENABLE_COW_EXISTENTIALS
-  bool UseCOWExistentials = true;
-#else
-  bool UseCOWExistentials = false;
-#endif
-
   /// Indicates which sanitizer is turned on.
   SanitizerKind Sanitize : 2;
 
   /// Emit compile-time diagnostics when the law of exclusivity is violated.
-  bool EnforceExclusivityStatic = false;
+  bool EnforceExclusivityStatic = true;
 
   /// Emit checks to trap at run time when the law of exclusivity is violated.
-  bool EnforceExclusivityDynamic = false;
-
-  /// Returns true when either static or dynamic exclusivity enforcement
-  /// is enabled.
-  bool isAnyExclusivityEnforcementEnabled() {
-    return EnforceExclusivityStatic || EnforceExclusivityDynamic;
-  }
+  bool EnforceExclusivityDynamic = true;
 
   /// Enable the mandatory semantic arc optimizer.
   bool EnableMandatorySemanticARCOpts = false;
+
+  /// \brief Enable large loadable types IRGen pass.
+  bool EnableLargeLoadableTypes = false;
 
   SILOptions() : Sanitize(SanitizerKind::None) {}
 
